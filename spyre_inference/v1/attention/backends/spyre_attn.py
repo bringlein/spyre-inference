@@ -16,8 +16,8 @@
 
 This backend implements attention using individual page tensors (one per KV block)
 and FlashAttention-style online softmax that iterates over pages. Each page is a
-complete tensor [num_kv_heads, block_size, head_size] on the target device, passed
-directly to bmm without any slicing.
+complete tensor [num_kv_heads, block_size, head_size//64, 64] on the target device,
+with explicit stick layout (64-element stick as innermost dimension).
 
 Architecture:
   - KV cache: two separate lists (k_pages, v_pages), managed by the model runner.
@@ -31,6 +31,7 @@ from typing import ClassVar, Callable
 import torch
 
 from spyre_inference.custom_ops.utils import convert
+from torch.spyre import SpyreTensorLayout, get_device_dtype
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -158,6 +159,13 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     """Create a reshape_and_cache with fixed token count for torch.compile.
 
     Dynamo unrolls the loop because num_tokens is a closure constant.
+    
+    K/V pages layout: [num_kv_heads, block_size, head_size//64, 64]
+    key/value tokens: [num_kv_heads, head_size]
+    
+    We write the token at the block_size dimension (index 1).
+    The token is reshaped to [num_kv_heads, 1, head_size] and written
+    at the appropriate block_offset along dimension 1.
     """
 
     def specialized_reshape_and_cache_kernel(
@@ -167,8 +175,11 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         for t in range(num_tokens):
             block_idx = block_indices[t]
             block_offset = block_offsets[t]
+            # key[t]: [num_kv_heads, head_size]
+            # Reshape to [num_kv_heads, 1, head_size] to write at block_size dim
             k_tok = key[t].unsqueeze(1)
             v_tok = value[t].unsqueeze(1)
+            # Write at dimension 1 (block_size dimension) with block_offset
             _overwrite(k_tok, k_pages[block_idx], [1], [block_offset])
             _overwrite(v_tok, v_pages[block_idx], [1], [block_offset])
 
@@ -633,7 +644,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Write new K/V tokens into their respective pages.
 
         key, value: [num_tokens, num_kv_heads, head_size]
-        k_pages, v_pages: list[Tensor], each [num_kv_heads, block_size, head_size]
+        k_pages, v_pages: list[Tensor], each [num_kv_heads, block_size, head_size//64, 64]
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
         """
         num_tokens = key.shape[0]
@@ -697,28 +708,82 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 )
 
             # Reshape: [padded_query_len, num_heads, head_size]
-            #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
+            # For MHA (num_queries_per_kv=1), collapse the degenerate dimension
+            # to avoid compiler issues with layout propagation.
+            # For GQA, keep the full structure.
             q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
-            q = q.reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
+            
+            if num_queries_per_kv == 1:
+                # MHA: reshape to [num_kv_heads, padded_query_len, head_size]
+                # avoiding the degenerate dimension that causes layout issues
+                q = q.reshape(num_kv_heads, padded_query_len, head_size)
+                q_reshaped_for_result = True
+            else:
+                # GQA: use standard reshape
+                q = q.reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
+                q_reshaped_for_result = False
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
             mask_tiles = [m.to(self._target_device) for m in mask_tiles_all[seq_idx]]
 
-            # Run attention on target device
-            q_dev = convert(q, self._target_device, self._target_dtype)
+            # Run attention on target device with explicit layout for query tensor.
+            # Use same stickification strategy as K/V pages: split head_size into
+            # 64-element sticks. This matches the working example in
+            # paged_vector_add_target.py and allows the compiler to handle
+            # the reduction over multiple sticks.
+            if q_reshaped_for_result:
+                # MHA layout: [num_kv_heads, padded_query_len, head_size // 64, 64]
+                q_stl = SpyreTensorLayout(
+                    device_size=[num_kv_heads, padded_query_len, head_size // 64, 64],
+                    stride_map=[
+                        padded_query_len * head_size,  # stride for num_kv_heads
+                        head_size,                    # stride for padded_query_len
+                        64,                           # stride for head_size//64
+                        1,                            # stride for 64-element stick (innermost)
+                    ],
+                    device_dtype=get_device_dtype(self._target_dtype),
+                )
+            else:
+                # GQA layout: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size // 64, 64]
+                q_stl = SpyreTensorLayout(
+                    device_size=[num_kv_heads, num_queries_per_kv, padded_query_len, head_size // 64, 64],
+                    stride_map=[
+                        num_queries_per_kv * padded_query_len * head_size,  # stride for num_kv_heads
+                        padded_query_len * head_size,                        # stride for num_queries_per_kv
+                        head_size,                                           # stride for padded_query_len
+                        64,                                                  # stride for head_size//64
+                        1,                                                   # stride for 64-element stick (innermost)
+                    ],
+                    device_dtype=get_device_dtype(self._target_dtype),
+                )
+            q_dev = q.to(self._target_device, device_layout=q_stl)
             attn_fn = self._get_attn_fn(num_blocks_needed, padded_query_len)
             result = attn_fn(q_dev, k_pages, v_pages, page_indices, mask_tiles, self.scale)
 
-            # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
-            #   → [query_len, num_heads, head_size]
-            result = result.reshape(1, num_heads, padded_query_len, head_size)
-            result = result.transpose(1, 2).contiguous()
-            seq_result = result[0, :query_len, :, :]
-
-            # Convert to output dtype and write into output buffer
-            seq_result = convert(seq_result, self._target_device, output.dtype)
-            for i in range(seq_result.shape[0]):
-                _overwrite(seq_result[i : i + 1], output, [0], [q_start + i])
+            # Reshape back to output format based on how we reshaped the query
+            if q_reshaped_for_result:
+                # MHA: result from kernel is [num_kv_heads, padded_query_len, head_size]
+                # Transpose to [padded_query_len, num_kv_heads, head_size]
+                result = result.transpose(0, 1).contiguous()
+                # Slice to actual query length: [query_len, num_kv_heads, head_size]
+                result = result[:query_len, :, :]
+                # Convert to output dtype
+                result = convert(result, self._target_device, output.dtype)
+                # Write entire sequence at once using narrow
+                # This avoids per-row _overwrite which has compiler issues
+                output_slice = output.narrow(0, q_start, query_len)
+                output_slice.copy_(result)
+            else:
+                # GQA: result is [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
+                # Reshape to [1, num_heads, padded_query_len, head_size] then transpose
+                result = result.reshape(1, num_heads, padded_query_len, head_size)
+                result = result.transpose(1, 2).contiguous()
+                seq_result = result[0, :query_len, :, :]
+                
+                # Convert to output dtype and write
+                seq_result = convert(seq_result, self._target_device, output.dtype)
+                for i in range(seq_result.shape[0]):
+                    _overwrite(seq_result[i : i + 1], output, [0], [q_start + i])
 
         return output

@@ -48,6 +48,8 @@ import numpy as np
 
 from vllm.config import VllmConfig, CompilationMode
 from vllm.logger import init_logger
+
+from torch.spyre import SpyreTensorLayout, get_device_dtype
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
@@ -340,30 +342,41 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_kv_heads = kv_cache_spec.num_kv_heads
             head_size = kv_cache_spec.head_size
 
-            # Default stickification splits head_size into 64-element sticks.
-            # Alternative: stickify block_size or num_kv_heads for different
-            # access patterns (would require explicit SpyreTensorLayout).
+            # Create explicit SpyreTensorLayout for KV cache pages.
+            # Standard layout matching paged_vector_add_target.py example.
+            # The compiler should handle the transpose in the attention kernel.
+            page_stl = SpyreTensorLayout(
+                device_size=[num_kv_heads, block_size, head_size // 64, 64],
+                stride_map=[
+                    block_size * head_size,  # stride for num_kv_heads
+                    head_size,               # stride for block_size
+                    64,                      # stride for head_size//64
+                    1,                       # stride for 64-element stick (innermost)
+                ],
+                device_dtype=get_device_dtype(torch.float16),
+            )
+
+            # Create pages on CPU first, then transfer to Spyre with explicit layout
             k_pages: list[torch.Tensor] = []
             v_pages: list[torch.Tensor] = []
             for _ in range(num_blocks):
-                k_pages.append(
-                    torch.zeros(
-                        num_kv_heads,
-                        block_size,
-                        head_size,
-                        dtype=torch.float16,
-                        device=self._spyre_device,
-                    )
+                k_page_cpu = torch.zeros(
+                    num_kv_heads,
+                    block_size,
+                    head_size,
+                    dtype=torch.float16,
+                    device="cpu",
                 )
-                v_pages.append(
-                    torch.zeros(
-                        num_kv_heads,
-                        block_size,
-                        head_size,
-                        dtype=torch.float16,
-                        device=self._spyre_device,
-                    )
+                v_page_cpu = torch.zeros(
+                    num_kv_heads,
+                    block_size,
+                    head_size,
+                    dtype=torch.float16,
+                    device="cpu",
                 )
+                # Transfer to Spyre device with explicit layout
+                k_pages.append(k_page_cpu.to(self._spyre_device, device_layout=page_stl))
+                v_pages.append(v_page_cpu.to(self._spyre_device, device_layout=page_stl))
 
             page_cache = (k_pages, v_pages)
             for layer_name in group.layer_names:

@@ -16,6 +16,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from torch.spyre import SpyreTensorLayout, get_device_dtype
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -62,7 +63,7 @@ def configure_compilation(request, monkeypatch):
 
     # Reset dynamo cache first to ensure config changes take effect
     torch._dynamo.reset()
-    
+
     cfg = get_cached_compilation_config()
     original_mode = cfg.mode
 
@@ -330,9 +331,31 @@ def test_spyre_attn(
                 k_pages_cpu[actual_block][:, block_offset, :] = historical_keys[token_idx]
                 v_pages_cpu[actual_block][:, block_offset, :] = historical_values[token_idx]
 
-    # Transfer populated pages to device
-    k_pages: list[torch.Tensor] = [p.to(cache_device) for p in k_pages_cpu]
-    v_pages: list[torch.Tensor] = [p.to(cache_device) for p in v_pages_cpu]
+    # Transfer populated pages to device with explicit layout for Spyre
+    if configure_device == "spyre":
+        # Use explicit SpyreTensorLayout for KV cache pages to ensure
+        # compatible stickification for batch matmul operations.
+        # This matches the layout used in spyre_model_runner.py and
+        # the working example in paged_vector_add_target.py
+        page_stl = SpyreTensorLayout(
+            device_size=[num_kv_heads, block_size, head_size // 64, 64],
+            stride_map=[
+                block_size * head_size,
+                head_size,
+                64,
+                1,
+            ],
+            device_dtype=get_device_dtype(dtype),
+        )
+        k_pages: list[torch.Tensor] = [
+            p.to(cache_device, device_layout=page_stl) for p in k_pages_cpu
+        ]
+        v_pages: list[torch.Tensor] = [
+            p.to(cache_device, device_layout=page_stl) for p in v_pages_cpu
+        ]
+    else:
+        k_pages: list[torch.Tensor] = [p.to(cache_device) for p in k_pages_cpu]
+        v_pages: list[torch.Tensor] = [p.to(cache_device) for p in v_pages_cpu]
 
     # Create slot mapping for new query tokens
     slot_mapping = []
