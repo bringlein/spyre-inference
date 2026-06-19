@@ -691,17 +691,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _target_device = k_pages[0].device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Spyre slicing corrupts memory, so
-        # bring k/v to CPU for slicing in _reshape_and_cache.
-        # Query needs both device and CPU copies:
-        #   - On-device (Spyre): used for decode via unbind (avoids CPU round-trip)
-        #   - CPU: only needed for prefill/mixed batches where GQA reshape
-        #     requires transpose, which corrupts data on Spyre when both
-        #     transposed dims are > 1.
+        # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
+        # Query handling depends on whether we can stay on device:
+        #   - Single-sequence decode: on-device unbind+reshape works (offset 0)
+        #   - Batch decode: needs CPU copy because unbind views at offset > 0
+        #     corrupt bmm results on Spyre
+        #   - Prefill/mixed: needs CPU copy because GQA reshape requires
+        #     transpose+contiguous which corrupts when both dims > 1
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
-        query_dev = convert(query, _target_device)
-        query_cpu = convert(query, "cpu") if attn_metadata.max_query_len > 1 else None
+        needs_query_cpu = attn_metadata.max_query_len > 1 or attn_metadata.num_seqs > 1
+        query_cpu = convert(query, "cpu") if needs_query_cpu else None
 
         # Step 1: Reshape and cache — write new tokens into pages
         self._reshape_and_cache(
@@ -715,6 +715,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
         # Step 2: Online softmax attention over pages (varlen)
+        # Pass on-device query for single-sequence decode (unbind at offset 0)
+        query_dev = convert(query, _target_device) if not needs_query_cpu else None
         output = self._online_softmax_attention(
             query_dev,
             query_cpu,
@@ -756,7 +758,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _online_softmax_attention(
         self,
-        query_dev: torch.Tensor,
+        query_dev: torch.Tensor | None,
         query_cpu: torch.Tensor | None,
         k_pages: list[torch.Tensor],
         v_pages: list[torch.Tensor],
@@ -772,26 +774,22 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         Writes results directly into the caller's output buffer in-place.
 
-        The kernel operates in [KV, N*QPK, D] format to avoid any
-        transpose/permute on Spyre (which corrupts data when both transposed
-        dimensions are > 1). How q_for_matmul is built differs by path:
+        The kernel operates entirely in [KV, N*QPK, ...] format on device to
+        avoid any transpose/permute on Spyre (which corrupts data when both
+        transposed dims are > 1). How q_for_matmul is built:
 
-        - **Decode (query_len=1)**: stays entirely on device. unbind() gives a
-          single [H, D] tensor; reshaping to [KV, QPK, D] is a contiguous view
-          (the "transpose" is trivial since N=1). No CPU round-trip.
+        - **Single-sequence decode**: stays on device. query_dev is unbinded;
+          reshaping [H, D] -> [KV, QPK, D] at offset 0 is a safe contiguous
+          view. No CPU round-trip needed.
 
-        - **Prefill (query_len>1)**: requires a CPU round-trip. Going from N
-          separate [H, D] tokens to one [KV, N*QPK, D] tensor requires
-          reordering data across the token (N) and KV-group (KV) dimensions —
-          a true transpose. Spyre's transpose+contiguous silently corrupts
-          when both dims > 1, so we build q_for_matmul on CPU and transfer
-          the final contiguous result. This is acceptable because prefill is a
-          one-time cost per sequence; decode (the steady-state) stays on device.
+        - **Batch decode / prefill / mixed**: requires CPU round-trip. Batch
+          decode because unbind views at offset > 0 corrupt bmm on Spyre.
+          Prefill because going from N×[H, D] to [KV, N*QPK, D] needs a
+          transpose which corrupts on Spyre when both dims > 1.
 
         Args:
-            query_dev: Query tensor on target device [total_tokens, H, D].
-            query_cpu: Same query on CPU (for prefill GQA reshape), or None
-                for pure decode batches where the on-device path suffices.
+            query_dev: Query on target device (for single-seq decode), or None.
+            query_cpu: Query on CPU (for batch/prefill), or None.
         """
         num_heads = self.num_heads
         head_size = self.head_size
@@ -808,9 +806,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
 
-        # Unbind on device for the decode fast-path (list-based indirect access)
-        query_dev_unbound = query_dev.unbind(dim=0)  # Tuple of [H, D]
-
         for seq_idx in range(num_seqs):
             q_start = int(query_start_loc[seq_idx].item())
             q_end = int(query_start_loc[seq_idx + 1].item())
@@ -818,16 +813,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             kv_len = int(seq_lens[seq_idx].item())
             num_query_tokens = query_len
 
-            if num_query_tokens == 1:
-                # --- Decode path: on-device, no CPU round-trip ---
-                # reshape [H, D] -> [KV, QPK, D] is a contiguous view (safe)
-                q_for_matmul = query_dev_unbound[q_start].reshape(
+            if query_dev is not None and num_query_tokens == 1:
+                # Single-sequence decode: on-device, no CPU round-trip.
+                # reshape [H, D] -> [KV, QPK, D] is a contiguous view at
+                # offset 0 (single sequence guarantees first token).
+                q_for_matmul = query_dev.unbind(dim=0)[q_start].reshape(
                     num_kv_heads, num_queries_per_kv, head_size
                 )
             else:
-                # --- Prefill path: CPU round-trip required ---
-                # transpose+contiguous on Spyre corrupts data when both dims > 1.
-                # Build [KV, N*QPK, D] on CPU and transfer the contiguous result.
+                # Batch decode / prefill: build on CPU, transfer to device.
                 assert query_cpu is not None
                 q_slice = query_cpu[q_start:q_end]  # [N, H, D]
                 q_for_matmul = (
