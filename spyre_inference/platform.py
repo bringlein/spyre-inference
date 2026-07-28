@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import importlib.metadata
 import math
 import multiprocessing
@@ -21,8 +22,6 @@ from string import Template
 from typing import TYPE_CHECKING
 
 import torch
-
-from spyre_inference import envs
 
 
 # When running this plugin on a Mac, we assume it's for local development
@@ -50,6 +49,22 @@ else:
 logger = init_logger(__name__)
 
 
+def _disable_torch_accelerator() -> None:
+    # Spyre has no torch.accelerator device, so empty_cache()/synchronize()
+    # raise "Cannot access accelerator device when none is available." Our OOT
+    # platform (not CPU) makes vLLM's cleanup_dist_env_and_memory() skip its
+    # is_cpu() guard and call empty_cache() at EngineCore shutdown. Patch at
+    # import to cover every process; matches vLLM's CPU worker (issue #327).
+    def _noop(*args, **kwargs) -> None:
+        return None
+
+    torch.accelerator.empty_cache = _noop  # ty: ignore[invalid-assignment]
+    torch.accelerator.synchronize = _noop  # ty: ignore[invalid-assignment]
+
+
+_disable_torch_accelerator()
+
+
 class TorchSpyrePlatform(CpuPlatform):
     _enum = PlatformEnum.OOT
 
@@ -67,18 +82,65 @@ class TorchSpyrePlatform(CpuPlatform):
     # DISTRIBUTED_BACKEND_NAME via `dist.Backend.register_backend`).
     dist_backend: str = "cpu:gloo,spyre:spyreccl"
 
-    # Register the PyTorch Native Attention implementation as the CUSTOM backend.
-    # SPYRE_ATTN_IMPL=exp selects spyre_attn_exp.py; anything else uses spyre_attn.py.
-    if envs.SPYRE_ATTN_IMPL == "exp":
-        _backend_path = "spyre_inference.v1.attention.backends.spyre_attn_exp.SpyreAttentionBackend"
-    else:
-        _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
+    # Cap applied to `max_model_len` only when the user didn't pass one —
+    # `check_max_model_len` runs only in vLLM's model-derived branch.
+    _DEFAULT_DERIVED_MAX_MODEL_LEN = 2048
 
+    # Applied only when the user didn't pass `--max-num-seqs`; vLLM's own
+    # LLM_CLASS default is 256, which is heavy for CI/fixtures. Enforced by
+    # `pre_register_and_update`.
+    _DEFAULT_MAX_NUM_SEQS = 4
+
+    # Register the PyTorch Native Attention implementation as the CUSTOM backend.
+    _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
+
+    @classmethod
+    def check_max_model_len(cls, max_model_len: int) -> int:
+        # vLLM only calls this on the user-didn't-specify branch of
+        # `_get_and_verify_max_len`, so user-supplied values are untouched.
+        return min(max_model_len, cls._DEFAULT_DERIVED_MAX_MODEL_LEN)
+
+    @classmethod
+    def pre_register_and_update(cls, parser=None) -> None:
+        # Runs at the top of `EngineArgs.create_engine_config`, before
+        # `_set_default_max_num_seqs_and_batched_tokens_args`. This is the
+        # earliest safe seam to monkey-patch `EngineArgs`: doing it from
+        # `register()` cyclically re-imports arg_utils during platform
+        # discovery, and the swallowed ImportError silently downgrades us
+        # to CpuPlatform.
+        from vllm.engine.arg_utils import EngineArgs
+
+        original = EngineArgs._set_default_max_num_seqs_and_batched_tokens_args
+        if getattr(original, "_spyre_patched", False):
+            return
+
+        @functools.wraps(original)
+        def _spyre_patched(self, usage_context, model_config, parallel_config):
+            user_supplied = self.max_num_seqs is not None
+            original(self, usage_context, model_config, parallel_config)
+            if not user_supplied and self.max_num_seqs is not None:
+                self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
+
+        _spyre_patched._spyre_patched = True
+        EngineArgs._set_default_max_num_seqs_and_batched_tokens_args = _spyre_patched  # ty: ignore[invalid-assignment]
+
+    @classmethod
+    def import_kernels(cls) -> None:
+        # CpuPlatform.import_kernels() attempts to load vllm._C / _C_AVX*
+        # which don't exist with VLLM_TARGET_DEVICE=empty. Override to no-op.
+        pass
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return "torch-spyre"
+
+    @classmethod
+    def device_count(cls) -> int:
+        # CpuPlatform returns 1 (CPU = single device); for TP>1 we need the
+        # actual Spyre card count so upstream gates like
+        # `@multi_gpu_test(num_gpus=2)` don't skip on multi-card hosts.
+        return torch.spyre.device_count()
 
     @classmethod
     def log_server_boot(cls, vllm_config: VllmConfig) -> None:
@@ -146,6 +208,25 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
+        # Encoder (pooling) layers have no KV cache and run bidirectional SDPA;
+        # decoders use the paged backend. vLLM passes attn_type via the selector
+        # config, so the choice lives here rather than as a branch in the impl.
+        from vllm.v1.attention.backend import AttentionType
+
+        attn_selector_config = kwargs.get("attn_selector_config") or (args[0] if args else None)
+        attn_type = getattr(attn_selector_config, "attn_type", None)
+        if attn_type in (AttentionType.ENCODER, AttentionType.ENCODER_ONLY):
+            # Specific Spyre attention for encoder models.
+            backend_path = (
+                "spyre_inference.v1.attention.backends.spyre_encoder_attn."
+                "SpyreEncoderAttentionBackend"
+            )
+        else:
+            # Standard Spyre attention.
+            backend_path = cls._backend_path
+
+        # Register the selected Spyre attention implementation as CUSTOM.
+        register_backend(AttentionBackendEnum.CUSTOM, backend_path)
         return AttentionBackendEnum.CUSTOM.get_path()
 
     @classmethod
@@ -162,20 +243,18 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # Override block_size to a multiple of 64 if the user didn't explicitly set it.
         # The list-based attention backend requires 64-element stick alignment for
-        # torch.compile. Only override default (non-user-specified) values.
+        # torch.compile.
         cache_config = vllm_config.cache_config
-        if not cache_config.user_specified_block_size:
-            original_block_size = cache_config.block_size
-            if original_block_size % 64 != 0:
-                # Round up to nearest multiple of 64
-                new_block_size = ((original_block_size + 63) // 64) * 64
-                logger.warning(
-                    "Block size must be a multiple of 64 for the list-based attention "
-                    "backend. Overriding block_size from %d to %d.",
-                    original_block_size,
-                    new_block_size,
-                )
-                cache_config.block_size = new_block_size
+        original_block_size = cache_config.block_size
+        if original_block_size % 64 != 0:
+            new_block_size = ((original_block_size + 63) // 64) * 64
+            logger.warning(
+                "Block size must be a multiple of 64 for the list-based attention "
+                "backend. Overriding block_size from %d to %d.",
+                original_block_size,
+                new_block_size,
+            )
+            cache_config.block_size = new_block_size
 
         parallel_config = vllm_config.parallel_config
 
@@ -191,8 +270,6 @@ class TorchSpyrePlatform(CpuPlatform):
 
         # ---- worker ----
         if parallel_config.worker_cls == "auto":
-            # "auto" defaults to the CPUWorker as we inherit from the CpuPlatform
-            # Override with TorchSpyreWorker for Spyre-specific functionality
             worker_class = "spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker"
             logger.info("Loading worker from: %s", worker_class)
             parallel_config.worker_cls = worker_class
@@ -206,34 +283,51 @@ class TorchSpyrePlatform(CpuPlatform):
         logger.info("Loading scheduler from: %s", scheduler_class)
         scheduler_config.scheduler_cls = scheduler_class
 
-        # CPUWorker derives its KV-cache budget from host RAM, but on Spyre
-        # the cache lives on-device — the host-RAM math is meaningless and
-        # `gpu_memory_utilization * total_RAM` typically exceeds available
-        # RAM on Spyre boxes, tripping CPUWorker.__init__'s preflight check.
+        # Spyre's KV cache lives on-device with a fixed budget — the host-RAM
+        # math in CpuPlatform.check_and_update_config is meaningless for us.
         # Setting VLLM_CPU_KVCACHE_SPACE makes CpuPlatform.check_and_update_config
-        # populate `cache_config.kv_cache_memory_bytes` below, which both
-        # bypasses the preflight check and short-circuits the host-RSS math
-        # in CPUWorker.determine_available_memory. Skip when the user has
-        # explicitly supplied --kv-cache-memory-bytes so we don't clobber it.
+        # populate `cache_config.kv_cache_memory_bytes`, which
+        # TorchSpyreWorker.determine_available_memory returns directly.
+        # Skip when the user has explicitly supplied --kv-cache-memory-bytes.
         if vllm_config.cache_config.kv_cache_memory_bytes is None:
             os.environ.setdefault("VLLM_CPU_KVCACHE_SPACE", "4")
 
         # call CpuPlatform.check_and_update_config()
         super().check_and_update_config(vllm_config)
 
-        # Pin the on-device KV cache to exactly what's needed to fill the
-        # configured batch area: max_num_seqs sequences × ceil(max_model_len /
-        # block_size) blocks each. Anything more is over-allocation while
-        # the attention op is still unoptimized.
+        # Pin the on-device KV cache to what's needed to fill the batch area:
+        # max_num_seqs × ceil(max_model_len / block_size) blocks. This
+        # single-group formula only holds for homogeneous models; hybrid models
+        # build several KV cache groups whose block count depends on vLLM's
+        # internal layer-grouping (not knowable here), so we skip the cap and
+        # let vLLM size the cache from the profiled memory budget instead.
         cache_config = vllm_config.cache_config
         if cache_config.num_gpu_blocks_override is None:
-            max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-            max_model_len = vllm_config.model_config.max_model_len
-            blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
-            cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
-            logger.info(
-                "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
-                cache_config.num_gpu_blocks_override,
-                max_num_seqs,
-                blocks_per_seq,
-            )
+            if cls._is_hybrid_attention(vllm_config):
+                logger.info(
+                    "Hybrid attention model detected; leaving num_gpu_blocks "
+                    "to vLLM (skipping the single-group block-count override)."
+                )
+            else:
+                max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+                max_model_len = vllm_config.model_config.max_model_len
+                blocks_per_seq = math.ceil(max_model_len / cache_config.block_size)
+                cache_config.num_gpu_blocks_override = max_num_seqs * blocks_per_seq
+                logger.info(
+                    "Setting num_gpu_blocks_override=%d (%d seqs × %d blocks/seq)",
+                    cache_config.num_gpu_blocks_override,
+                    max_num_seqs,
+                    blocks_per_seq,
+                )
+
+    @staticmethod
+    def _is_hybrid_attention(vllm_config: VllmConfig) -> bool:
+        """Whether the model interleaves multiple attention types.
+
+        More than one distinct HF `layer_types` value means vLLM builds
+        multiple KV cache groups (a hybrid model).
+        """
+        model_config = vllm_config.model_config
+        hf_config = getattr(model_config, "hf_text_config", model_config.hf_config)
+        layer_types = getattr(hf_config, "layer_types", None)
+        return bool(layer_types) and len(set(layer_types)) > 1

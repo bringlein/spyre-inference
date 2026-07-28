@@ -8,7 +8,7 @@
 # Fields:
 #   rel_path          Path relative to upstream vLLM repo root
 #   allow_list[].test fnmatch glob matched against test function name
-#   allow_list[].mode mandatory_pass (default) | xfail | xfail_strict
+#   allow_list[].mode mandatory_pass (default) | skip | skip | skip_strict
 #   allow_list[].tags Labels applied as pytest markers (filterable via -m)
 #   allow_list[].params.skip
 #                     Parameter name -> list of values to skip
@@ -25,51 +25,53 @@
 
 tests:
   files:
-    # RMSNorm tests require either https://github.com/vllm-project/vllm/pull/36246 or vLLM IR
-    # changes to merge in order to pass
-    # - rel_path: tests/kernels/core/test_layernorm.py
-    #   allow_list:
-    #     - test: "test_rms_norm"
-    #       mode: mandatory_pass
-    #       tags: [rmsnorm, upstream]
-    #       params:
-    #         skip:
-    #           strided_input: [true]
-    #         override:
-    #           num_tokens: [1, 16]
-    #           hidden_size: [64]
-    #   block_list:
-    #     - test: "test_fused_rms_norm_quant"
-    - rel_path: tests/kernels/core/test_activation.py
+    # test_layernorm.py and test_activation.py cannot be used with the empty
+    # backend: they reference torch.ops._C.* in module-scope parametrize
+    # decorators, which causes collection failures when _C.so is not built.
+
+    - rel_path: tests/models/language/generation/test_common.py
       allow_list:
-        - test: "test_act_and_mul"
+        - test: "test_models"
           mode: mandatory_pass
-          tags: [siluandmul, upstream]
+          # uses_subprocess marker is added to make these tests run first.
+          # This must be added for any sets of tests that use `vllm.LLM`
+          tags: [model, upstream, uses_subprocess]
           params:
             allow:
-              activation: [silu_and_mul]
+              model:
+                # - openai-community/gpt2 # needs opaque-attention CPU dispatch + tied-weight lm_head fix
+                # - facebook/opt-125m # requires a torch-spyre fix for int adds
+                - meta-llama/Llama-3.2-1B-Instruct
+                - mistralai/Mistral-7B-Instruct-v0.3
+                # - Qwen/Qwen2.5-0.5B-Instruct # needs tied-weight lm_head fix (compute_logits hits cpu/spyre mixed-device decomposition)
+                # - TitanML/tiny-mixtral # needs swa support
             override:
-              num_tokens: [1, 7, 63, 64, 65, 83, 1024]
-              # Odd values fail op check. Not required for current list of models we plan to support
-              d: [8, 64, 512, 13824]
-              dtype: [torch.float32]
-              device: [cpu]
-          tolerances:
-            atol: 1e-2
-            rtol: 1e-2
+              max_tokens: [2] # one prefill and one decode for speed
+            skip:
+              # input embeddings not yet supported on spyre
+              use_prompt_embeds: [true]
 
-    # Model tests are now failing too :(
-    # - rel_path: tests/models/language/generation/test_common.py
+    # TODO: Re-enable once https://github.com/torch-spyre/spyre-inference/issues/324 is resolved.
+    #       Until then, equivalent tests live in tests/test_transformers_backend.py
+    #       (test_transformers_generate, test_tp2_transformers_generate_matches_tp1).
+    # - rel_path: tests/models/test_transformers.py
     #   allow_list:
     #     - test: "test_models"
     #       mode: mandatory_pass
-    #       # uses_subprocess marker is added to make these tests run first.
-    #       # This must be added for any sets of tests that use `vllm.LLM`
-    #       tags: [facebook, upstream, uses_subprocess]
+    #       tags: [transformers, upstream, uses_subprocess]
     #       params:
-    #         allow:  # skip every model except facebook/opt-125m
-    #           model:
-    #           - facebook/opt-125m
+    #         override:
+    #           "model,model_impl":
+    #           - ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "transformers"]
+    #           - ["meta-llama/Llama-3.2-1B-Instruct", "transformers"]
+    #     - test: "test_distributed"
+    #       mode: mandatory_pass
+    #       tags: [transformers, upstream, uses_subprocess, distributed]
+    #   block_list:
+    #     - test: "test_quantization"
+    #     - test: "test_embed_loading"
+    #     - test: "test_hybrid_attention"
+    #     - test: "test_pooling"
 
     - rel_path: tests/v1/attention/test_attention_backends.py
       allow_list:
@@ -80,15 +82,96 @@ tests:
           params:
             allow:
               tensor_parallel_size:
-              - 1
-              - 2
-              - 4
+                - 1
+                - 2
+                - 4
               batch_spec_name:
-              - single_decode
-              - single_prefill
-              - small_decode
-              - small_prefill
-              - mixed_small
+                - single_decode
+                - single_prefill
+                - small_decode
+                - small_prefill
+                - mixed_small
           fixture_names:
-          - "patch_backend_list"
+            - "patch_backend_list"
 
+    - rel_path: tests/models/language/generation/test_granite.py
+      allow_list:
+        - test: "test_models"
+          mode: mandatory_pass
+          tags: [granite, upstream, uses_subprocess]
+          params:
+            override:
+              model:
+                - ibm-ai-platform/micro-g3.3-8b-instruct-1b
+                - ibm-granite/granite-4.1-3b
+              dtype: [torch.float16]
+              max_tokens: [2] # one prefill and one decode
+
+    # gemma-3-1b-it is hybrid; test_dummy_loader exercises engine startup + KV
+    # cache init (the hybrid block-override path) with dummy weights, isolating
+    # it from gemma-3 generation quality. Injected via override (not in MODELS).
+    - rel_path: tests/models/language/generation/test_gemma.py
+      allow_list:
+        - test: "test_dummy_loader"
+          mode: mandatory_pass
+          tags: [gemma, upstream, uses_subprocess]
+          params:
+            override:
+              model:
+                - google/gemma-3-1b-it
+
+    - rel_path: tests/models/language/generation_ppl_test/test_qwen.py
+      allow_list:
+        - test: "test_ppl"
+          mode: skip # model_info0 (Qwen3-0.6B): RAS::VFIO::MapDMAFailed; model_info1 (Qwen3-0.6B-FP8): KeyError PlatformEnum.OOT - FP8 quant not supported on Spyre; model_info2 (Qwen3.5-0.8B): Qwen3_5ForConditionalGeneration not in vLLM registry
+          tags: [model, generation, upstream, uses_subprocess]
+
+    - rel_path: tests/models/language/pooling/test_embedding.py
+      allow_list:
+        - test: "test_models"
+          mode: mandatory_pass
+          tags: [model, embedding, upstream, uses_subprocess]
+          params:
+            allow:
+              model:
+                - BAAI/bge-base-en-v1.5
+                - sentence-transformers/all-MiniLM-L12-v2
+
+    - rel_path: tests/models/language/pooling/test_auto_prefix_cache_support.py
+      allow_list:
+        - test: "test_embed_models"
+          # Prefix-cache path for embeds not validated on Spyre yet.
+          mode: skip # RuntimeError: Spyre backend does not support type conversion yet during copy
+          tags: [model, embedding, upstream, uses_subprocess]
+          params:
+            override:
+              model: ["BAAI/bge-m3"]
+
+    - rel_path: tests/basic_correctness/test_basic_correctness.py
+      allow_list:
+        - test: "test_models"
+          # hardcoded prompt is ~5042 tokens; doesn't fit MAX_MODEL_LEN_CAP=128.
+          # Re-enable once the on-device KV cache cap is raised.
+          mode: skip
+          tags: [model, basic_correctness, upstream, uses_subprocess]
+          params:
+            override:
+              model:
+                # - Qwen/Qwen3-0.6B # needs rmsnorm dispatch fix
+                - ibm-ai-platform/micro-g3.3-8b-instruct-1b
+              backend: ["CUSTOM"]
+              enforce_eager: [true]
+        - test: "test_models_distributed"
+          mode: mandatory_pass
+          tags:
+            [model, basic_correctness, upstream, uses_subprocess, distributed]
+          params:
+            override:
+              # Upstream uses a single tuple parametrize keyed
+              # `(model, distributed_executor_backend, attention_backend, test_suite, extra_env)`;
+              # supply the full tuple per row.
+              "model, distributed_executor_backend, attention_backend, target_test_suites, extra_env":
+                - ["ibm-ai-platform/micro-g3.3-8b-instruct-1b", "mp", "CUSTOM", ["L4"], {}]
+            skip:
+              # input embeddings not yet supported on spyre
+              enable_prompt_embeds: [true]

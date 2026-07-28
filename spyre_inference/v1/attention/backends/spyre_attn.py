@@ -14,8 +14,11 @@
 
 """Paged KV-cache attention backend for Spyre using list-of-pages and online softmax."""
 
+import functools
 from dataclasses import dataclass
 from typing import Callable, ClassVar, NamedTuple
+
+import os
 
 import torch
 
@@ -38,6 +41,32 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
+
+# When set, wraps forward(), _reshape_and_cache(), and _online_softmax_attention()
+# in torch.profiler.record_function spans for kineto trace capture.
+_ATTN_PROFILING = os.environ.get("SPYRE_ATTN_PROFILING", "0") == "1"
+
+
+def _record_function(name: str):
+    def decorator(fn):
+        if not _ATTN_PROFILING:
+            return fn
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with torch.profiler.record_function(name):
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+# Force torch.compile(dynamic=False) on the Spyre attention/reshape kernels
+# regardless of the vLLM compilation config. Used to evaluate the compiled path
+# on Spyre, where CompilationMode.NONE otherwise makes _maybe_compile a no-op.
+# Default: off (unset or "0").
+_FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
 
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
@@ -84,7 +113,12 @@ def _overwrite(
     if output.device.type == "spyre":
         # `torch.ops.spyre.overwrite` is dynamically registered, so its
         # signature is opaque to the type checker (ParamSpec resolves to `...`).
-        torch.ops.spyre.overwrite(input, output, dims, offsets)  # ty: ignore[invalid-argument-type]
+        torch.ops.spyre.overwrite(
+            input,  # ty: ignore[invalid-argument-type]
+            output,  # ty: ignore[invalid-argument-type]
+            dims,  # ty: ignore[invalid-argument-type]
+            offsets,  # ty: ignore[invalid-argument-type]
+        )
     else:
         # intended behaviour on cpu
         sliced_t = output
@@ -196,6 +230,21 @@ def _maybe_compile(fn):
     return torch.compile(fn, dynamic=False)
 
 
+def _maybe_compile_attn(fn):
+    """Like _maybe_compile, but also honors the SPYRE_FORCE_COMPILE_ATTN
+    escape hatch.
+
+    Used only for the online-softmax attention kernel — the reshape/cache
+    kernel is *not* covered, because forcing compile on it currently hits an
+    unsupported torch-spyre Inductor path (missing device_tensor_layout on
+    graph input). Flip _get_reshape_fn to call this helper too once that gap
+    is resolved.
+    """
+    if _FORCE_COMPILE_ATTN:
+        return torch.compile(fn, dynamic=False)
+    return _maybe_compile(fn)
+
+
 # ---------------------------------------------------------------------------
 # Compilable factory functions
 # ---------------------------------------------------------------------------
@@ -225,16 +274,29 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     return specialized_reshape_and_cache_kernel
 
 
-def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int, num_queries_per_kv: int):
+def _create_compilable_page_attn(
+    num_blocks: int,
+    num_query_tokens: int,
+    num_queries_per_kv: int,
+    has_alibi: bool = False,
+    logits_soft_cap: float = 0.0,
+):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
-    Dynamo unrolls the loop because num_blocks and num_query_tokens are closure constants.
+    Dynamo unrolls the loop because num_blocks, num_query_tokens, has_alibi, and
+    logits_soft_cap are closure constants.
     The kernel is specialized for a fixed number of query tokens
     (e.g., 1 for decode, 4 for prefill).
     """
 
     def specialized_paged_attn_kernel(
-        q_for_matmul, k_pages, v_pages, page_indices, mask_tiles, scale
+        q_for_matmul,
+        k_pages,
+        v_pages,
+        page_indices,
+        mask_tiles,
+        scale,
+        alibi_bias_tiles=None,
     ):
         """
         This kernel specializes for num_blocks and num_query_tokens.
@@ -250,6 +312,12 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int, num_que
             page_indices: [num_blocks]
             mask_tiles: list of num_blocks tensors, each [N*QPK, block_size]
                 (pre-expanded: each query token's mask repeated QPK times)
+            alibi_bias_tiles: list of num_blocks tensors, each
+                [num_kv_heads, N*QPK, block_size] (only when has_alibi=True;
+                None otherwise). The bias is constant across query tokens
+                because softmax absorbs per-query-row constants — see the
+                derivation at the bias-tile construction site in
+                _online_softmax_attention.
         """
         tile_max = None
         tile_sum = None
@@ -269,11 +337,22 @@ def _create_compilable_page_attn(num_blocks: int, num_query_tokens: int, num_que
             # scores: [KV, N*QPK, D] @ [KV, D, B] = [KV, N*QPK, B]
             scores = torch.bmm(q_for_matmul, k_transposed)
             scores *= scale
+            if logits_soft_cap > 0.0:
+                # Pull logits into (-cap, +cap) before the mask add so masked
+                # positions still map cleanly to -inf. Applied before the ALiBi
+                # bias so the positional term is not squashed by the tanh.
+                scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+            if has_alibi:
+                # ALiBi bias slope[h] * (kv_pos - context_len). The additive
+                # mask_tile below uses finfo.min for masked positions, so this
+                # bias cannot un-mask them.
+                assert alibi_bias_tiles is not None
+                scores = scores + alibi_bias_tiles[i]
 
             # Mask: [N*QPK, B] -> [1, N*QPK, B] for broadcasting with [KV, N*QPK, B]
             scores = scores + mask_tile.unsqueeze(0)
 
-            scores_max = scores.max(dim=-1, keepdim=True)[0]  # [KV, N*QPK, 1]
+            scores_max = torch.amax(scores, dim=-1, keepdim=True)  # [KV, N*QPK, 1]
 
             if i == 0:
                 tile_max = scores_max
@@ -359,7 +438,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     # Pre-tiled additive attention mask. attention_mask_tiles[seq_idx][block_idx]
     # gives the mask tile for one KV page of one sequence.
-    # Each tile: [aligned_max_query_len, block_size] on CPU.
+    # Each tile: [query_len_for_seq, block_size] on CPU.
     attention_mask_tiles: list[list[torch.Tensor]] | None = None
 
     # Global aligned query length for stable kernel compilation.
@@ -395,6 +474,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = kv_cache_spec.block_size
         self.head_size = kv_cache_spec.head_size
+        self.sliding_window = getattr(kv_cache_spec, "sliding_window", None)
+        if self.sliding_window is not None and self.sliding_window <= 0:
+            raise ValueError(f"sliding_window must be positive, got {self.sliding_window}")
 
         # Validate block_size alignment: Spyre stick size is 128 bytes (64 fp16 elements).
         # block_size must be a multiple of 64 to avoid restickification errors during
@@ -457,11 +539,22 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 causal_ok = kv_pos.unsqueeze(0) <= causal_limit.unsqueeze(1)
                 attend = attend & causal_ok
 
-            # Convert to additive mask (mask_bool is already boolean from comparisons)
-            mask_bool = ~attend
+            # Sliding window mask: limit attention to recent tokens.
+            # For query at absolute position p, attend to
+            # [max(0, p - sliding_window + 1), p].
+            if self.sliding_window is not None:
+                context_len_s = kv_len_s - query_len_s
+                window_start = (context_len_s + q_pos - self.sliding_window + 1).clamp(min=0)
+                window_ok = kv_pos.unsqueeze(0) >= window_start.unsqueeze(1)
+                attend = attend & window_ok
+
+            # Convert to additive mask: finfo.min for masked positions, 0 for valid
+            #  (mask_bool is already boolean from comparisons)
+            mask_bool = ~attend  # [query_len, aligned_max_seq_len]
+            fill = torch.finfo(self.model_dtype).min
             mask_additive = torch.where(
                 mask_bool,
-                torch.tensor(-65504.0, dtype=self.model_dtype, device=device),
+                torch.tensor(fill, dtype=self.model_dtype, device=device),
                 torch.tensor(0.0, dtype=self.model_dtype, device=device),
             )
 
@@ -476,7 +569,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # TODO: think of reuse of mask tiles
                 if tile.shape[1] < block_size:
                     tile = torch.nn.functional.pad(
-                        tile, (0, block_size - tile.shape[1]), mode="constant", value=-65504.0
+                        tile, (0, block_size - tile.shape[1]), mode="constant", value=fill
                     )
                 seq_tiles.append(tile.contiguous())
 
@@ -499,7 +592,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         block_table = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
 
-        apply_causal_mask = common_attn_metadata.causal and max_query_len > 1
+        causal = common_attn_metadata.causal
+        if isinstance(causal, torch.Tensor):
+            causal = bool(causal.item())
+        apply_causal_mask = causal and max_query_len > 1
 
         aligned_max_query_len = (
             (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
@@ -636,6 +732,27 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
 
+        # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
+        # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
+        # per-block bias construction in _online_softmax_attention broadcasts
+        # cleanly against the score-tile shape.
+        if alibi_slopes is not None:
+            slopes_t = torch.tensor(alibi_slopes, dtype=torch.float16)
+            if slopes_t.numel() != num_heads:
+                raise ValueError(
+                    f"alibi_slopes must have length num_heads={num_heads}, got {slopes_t.numel()}"
+                )
+            self.alibi_slopes: torch.Tensor | None = slopes_t.view(
+                num_kv_heads, self.num_queries_per_kv, 1, 1
+            )
+        else:
+            self.alibi_slopes = None
+
+        # Normalise the API's Optional[float] into a plain float so the kernel
+        # can bake it as a closure constant. logits_soft_cap == 0.0 disables
+        # soft-capping (kernel takes the same path as upstream).
+        self.logits_soft_cap: float = 0.0 if logits_soft_cap is None else float(logits_soft_cap)
+
         # Compiled function caches (keyed by iteration count for reshape, and
         # by (num_blocks, padded_query_len) for the per-page attention loop)
         self._reshape_fns: dict[int, object] = {}
@@ -643,25 +760,32 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
-        if alibi_slopes is not None:
-            raise NotImplementedError("ALiBi slopes not supported yet")
-        if sliding_window is not None:
-            raise NotImplementedError("Sliding window not supported yet")
-        if logits_soft_cap is not None:
-            raise NotImplementedError("Logits soft cap not supported yet")
-
     def _get_reshape_fn(self, num_tokens: int):
         if num_tokens not in self._reshape_fns:
+            # Deliberately uses _maybe_compile (not _maybe_compile_attn):
+            # SPYRE_FORCE_COMPILE_ATTN must not force-compile this kernel.
+            # torch.compile of _create_compilable_reshape_and_cache currently
+            # fails inside torch-spyre's Inductor pass with
+            # `Unsupported: missing device_tensor_layout on graph input arg0_1`.
+            # Move to _maybe_compile_attn once that gap is resolved.
             self._reshape_fns[num_tokens] = _maybe_compile(
                 _create_compilable_reshape_and_cache(num_tokens)
             )
         return self._reshape_fns[num_tokens]
 
     def _get_attn_fn(self, num_blocks: int, num_query_tokens: int, num_queries_per_kv: int):
+        # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
+        # has_alibi and logits_soft_cap don't need to be part of the cache key.
         key = (num_blocks, num_query_tokens, num_queries_per_kv)
         if key not in self._attn_fns:
-            self._attn_fns[key] = _maybe_compile(
-                _create_compilable_page_attn(num_blocks, num_query_tokens, num_queries_per_kv)
+            self._attn_fns[key] = _maybe_compile_attn(
+                _create_compilable_page_attn(
+                    num_blocks,
+                    num_query_tokens,
+                    num_queries_per_kv,
+                    has_alibi=self.alibi_slopes is not None,
+                    logits_soft_cap=self.logits_soft_cap,
+                )
             )
         return self._attn_fns[key]
 
@@ -670,6 +794,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     # and `bind_kv_cache` smuggles through a dict typed `dict[str, Tensor]`.
     # The matching pair of overrides preserves the runtime contract; ty
     # cannot see the co-evolution.
+    @_record_function("spyre_attn::forward")
     def forward(  # ty: ignore[invalid-method-override]
         self,
         layer: AttentionLayer,
@@ -729,6 +854,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         return output
 
+    @_record_function("spyre_attn::reshape_and_cache")
     def _reshape_and_cache(
         self,
         key_cpu: torch.Tensor,
@@ -756,6 +882,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         fn = self._get_reshape_fn(num_tokens)
         fn(key_cpu, value_cpu, k_pages, v_pages, block_indices, block_offsets, _target_device)
 
+    @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
         self,
         query_dev: torch.Tensor | None,
@@ -806,6 +933,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
 
+        # Scattering into `output` on Spyre dim=0 has no working primitive:
+        # `output[i:j] = ...` and `narrow().copy_(...)` silently write to row 0;
+        # `torch.ops.spyre.overwrite` is deprecated and its compile_once wrapper
+        # compiles one SDSC binary per unique offset, which recurses past the
+        # dynamo cache limit once vLLM's model compile has filled it. Raising
+        # the limit unblocks short tests but compiles N binaries for a
+        # query_len=N prefill, which doesn't scale to long contexts. Stage the
+        # result on CPU and bulk-copy at the end of the per-sequence loop.
+        # Revisit when torch-spyre lands symbolic-offset overwrite
+        # (torch-spyre#220 / #1371-3).
+        output_cpu = torch.zeros_like(output, device="cpu")
+
         for seq_idx in range(num_seqs):
             q_start = int(query_start_loc[seq_idx].item())
             q_end = int(query_start_loc[seq_idx + 1].item())
@@ -832,13 +971,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 )
                 q_for_matmul = convert(q_for_matmul, _target_device)
 
-            # TODO: MHA (num_queries_per_kv=1) currently fails due to a Spyre compiler
-            # bug in layout propagation through transpose operations. The compiler's
-            # deadcode elimination pass fails with stride/index mismatches when
-            # handling the degenerate dimension in MHA. GQA (num_queries_per_kv > 1)
-            # works correctly. See error: "cannot restickify any input layout of y
-            # to carry y_var=d2" in propagate_layouts.py:341
-
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
             # Expand mask tiles for GQA on CPU: [N, B] -> [N*QPK, B]
@@ -852,13 +984,55 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 for m in mask_tiles_all[seq_idx]
             ]
 
-            # Run attention on target device
-            # Kernel is specialized for (num_blocks, num_query_tokens, num_queries_per_kv)
+            # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
+            #
+            # The full ALiBi form is slope[h] * (kv_pos - (context_len + q_rel)),
+            # which varies over both query and KV positions. The (context_len + q_rel)
+            # term is a per-query-row constant, and softmax is invariant under adding
+            # any per-row constant to its input (numerator and denominator both pick
+            # up the same exp() factor). We therefore drop it and keep only the
+            # kv-dependent term — the softmax output is bit-identical to the full form.
+            #
+            # Matches vllm/v1/attention/ops/triton_attention_helpers.py::apply_alibi_to_score
+            # (alibi_offset = seq_offset - context_len) — the production Triton path.
+            #
+            # The kernel scores are [KV, N*QPK, block_size]; the bias is constant
+            # across the N query tokens, so each per-block tile is built as
+            # [KV, QPK, block_size] and repeated N times along the query-token axis
+            # to match the token-major N*QPK layout of q_for_matmul.
+            alibi_bias_tiles: list[torch.Tensor] | None = None
+            if self.alibi_slopes is not None:
+                context_len = kv_len - query_len
+                slopes = self.alibi_slopes.reshape(num_kv_heads, num_queries_per_kv, 1)
+                alibi_bias_tiles = []
+                for b in range(num_blocks_needed):
+                    kv_pos = torch.arange(
+                        b * block_size,
+                        (b + 1) * block_size,
+                        dtype=torch.float16,
+                    )
+                    rel = (kv_pos - context_len).view(1, 1, block_size)
+                    bias = slopes * rel  # [KV, QPK, block_size]
+                    bias = bias.repeat(1, num_query_tokens, 1)  # [KV, N*QPK, block_size]
+                    alibi_bias_tiles.append(convert(bias, device=_target_device))
+
+            # Run attention on target device.
+            # Kernel is specialized for (num_blocks, num_query_tokens, num_queries_per_kv).
             attn_fn = self._get_attn_fn(num_blocks_needed, num_query_tokens, num_queries_per_kv)
-            result = attn_fn(q_for_matmul, k_pages, v_pages, page_indices, mask_tiles, self.scale)
+            result = attn_fn(
+                q_for_matmul,
+                k_pages,
+                v_pages,
+                page_indices,
+                mask_tiles,
+                self.scale,
+                alibi_bias_tiles=alibi_bias_tiles,
+            )
 
             # Result is [KV, N*QPK, D] — convert to [N, H, D] on CPU
-            # (transpose on Spyre would corrupt; CPU reshape is safe)
+            # (transpose on Spyre would corrupt; CPU reshape is safe) and write
+            # into the CPU staging buffer; one bulk H2D at the end replaces the
+            # per-token writes.
             result_cpu = convert(result, "cpu", output.dtype)
             result_cpu = (
                 result_cpu.reshape(num_kv_heads, num_query_tokens, num_queries_per_kv, head_size)
@@ -866,12 +1040,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 .contiguous()
                 .reshape(num_query_tokens, num_heads, head_size)
             )
-            for i in range(query_len):
-                tok = convert(
-                    result_cpu[i : i + 1].contiguous(),
-                    _target_device,
-                    output.dtype,
-                )
-                _overwrite(tok, output, [0], [q_start + i])
+            output_cpu[q_start:q_end] = result_cpu[:query_len]
 
+        output.copy_(convert(output_cpu, device=_target_device))
         return output

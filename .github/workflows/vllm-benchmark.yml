@@ -1,0 +1,201 @@
+name: vLLM Benchmark
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      vllm_branch:
+        description: >
+          vLLM branch to benchmark (main, or refs/pull/PR_NUMBER/head for
+          pre-merge check)
+        required: true
+        type: string
+        default: main
+      vllm_commit:
+        description: >
+          vLLM commit SHA (optional, defaults to latest on the branch)
+        required: false
+        type: string
+      models:
+        description: >
+          Comma-separated list of models to benchmark (optional, default all)
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.event_name == 'workflow_dispatch' && inputs.vllm_branch != '' && inputs.vllm_branch) || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  # ─── Generate benchmark matrix from spyre config files ───
+  set-parameters:
+    runs-on: ubuntu-latest
+    outputs:
+      benchmark_matrix: ${{ steps.set-parameters.outputs.benchmark_matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Generate benchmark matrix
+        id: set-parameters
+        env:
+          MODELS: ${{ inputs.models || '' }}
+        run: |
+          set -eux
+          pip install pyyaml
+          python .github/scripts/generate_vllm_benchmark_matrix.py \
+            --benchmark-configs-dir vllm-benchmarks/benchmarks \
+            --models "${MODELS}"
+
+  # ─── Run vLLM benchmarks on Spyre hardware ───
+  benchmarks:
+    name: Run vLLM benchmarks (${{ matrix.models }})
+    needs: set-parameters
+    strategy:
+      matrix: ${{ fromJson(needs.set-parameters.outputs.benchmark_matrix) }}
+      fail-fast: false
+    runs-on:
+      - x86_64
+      - spyre_pf_x4__pvc_1tb_x1
+      - linux
+      - image_torch_spyre
+    timeout-minutes: 240
+    env:
+      CI: ''
+      VLLM_CPU_KVCACHE_SPACE: '16'
+      DTLOG_LEVEL: error
+      FLEX_COMPUTE: SENTIENT
+      FLEX_DEVICE: PF
+      AIU_SETUP_MULTI_AIU: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      SAVE_TO_PYTORCH_BENCHMARK_FORMAT: '1'
+      VLLM_PLUGINS: spyre_inference
+      DEVICE_NAME: spyre
+      DEVICE_TYPE: IBM_Spyre
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Spyre RPMs
+        id: spyre-rpms
+        uses: ./.github/actions/spyre-rpm-install
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          # Invalidate only on lock changes; setup-uv's default glob also hashes
+          # pyproject.toml, so config-only edits would needlessly bust the cache.
+          cache-dependency-glob: |
+            uv.lock
+            spyre-rpms.lock
+          cache-local-path: ${{ runner.temp }}/setup-uv-cache
+          prune-cache: false
+
+      - name: Install spyre-inference
+        run: |
+          source "$HOME/.bashrc"
+          source /etc/profile.d/ibm-aiu-setup.sh
+          uv sync --frozen --verbose --group dev
+          echo "=== Installed versions ==="
+          uv pip show torch torch-spyre vllm spyre-inference 2>/dev/null || true
+
+      - name: Resolve vLLM commit
+        env:
+          INPUT_VLLM_BRANCH: ${{ inputs.vllm_branch || 'main' }}
+          INPUT_VLLM_COMMIT: ${{ inputs.vllm_commit || '' }}
+        run: |
+          set -eux
+          VLLM_BRANCH="${INPUT_VLLM_BRANCH}"
+          VLLM_COMMIT="${INPUT_VLLM_COMMIT}"
+
+          if [[ -n "${VLLM_COMMIT}" ]]; then
+            HEAD_SHA="${VLLM_COMMIT}"
+          else
+            HEAD_SHA=$(git ls-remote https://github.com/vllm-project/vllm.git "${VLLM_BRANCH}" | awk '{print $1}')
+          fi
+
+          echo "HEAD_SHA=${HEAD_SHA}" >> "$GITHUB_ENV"
+          echo "### Benchmarking vLLM [${HEAD_SHA}](https://github.com/vllm-project/vllm/commit/${HEAD_SHA})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run vLLM benchmarks
+        # aiu-setup + the benchmark invocation both live in the Makefile's
+        # perf-tests target now -- the single entrypoint, so this doesn't
+        # hand-duplicate ibm-aiu-setup.sh sourcing.
+        run: |
+          mkdir -p benchmark-results
+          make perf-tests RESULTS_DIR=benchmark-results > benchmark-results/run.log 2>&1
+
+      - name: Install ClickHouse ingest dependencies
+        if: github.event_name == 'push'
+        run: |
+          set -eux
+          uv pip install -r .github/scripts/requirements-benchmark.txt
+
+      - name: Ingest benchmark results into ClickHouse
+        if: github.event_name == 'push'
+        env:
+          CLICKHOUSE_HOST: ${{ secrets.CLICKHOUSE_HOST }}
+          CLICKHOUSE_PORT: ${{ secrets.CLICKHOUSE_PORT }}
+          CLICKHOUSE_USER: ${{ secrets.CLICKHOUSE_USER }}
+          CLICKHOUSE_PASS: ${{ secrets.CLICKHOUSE_PASS }}
+          CLICKHOUSE_DB: ${{ secrets.CLICKHOUSE_DB }}
+          BENCHMARK_BRANCH: ${{ github.ref_name }}
+          BENCHMARK_SHA: ${{ github.sha }}
+          PR_NUMBER: "0"
+        run: |
+          set -eux
+
+          JSON_COUNT=$(find benchmark-results -name "*.pytorch.json" 2>/dev/null | wc -l || echo 0)
+          echo "PyTorch JSON result files found: ${JSON_COUNT}"
+
+          if [[ "${JSON_COUNT}" -eq 0 ]]; then
+            echo "No PyTorch benchmark result files found; failing ClickHouse ingest."
+            exit 1
+          fi
+
+          uv run python3 .github/scripts/ingest_vllm_benchmarks.py \
+            --results-dir benchmark-results \
+            --workflow "vLLM Benchmark" \
+            --branch "${BENCHMARK_BRANCH}" \
+            --sha "${BENCHMARK_SHA}" \
+            --run-id "${{ github.run_id }}" \
+            --job-id "0" \
+            --pr-number "${PR_NUMBER}"
+
+      - name: Job Summary
+        if: always()
+        env:
+          INPUT_VLLM_BRANCH: ${{ inputs.vllm_branch || 'main' }}
+          MATRIX_MODELS: ${{ matrix.models }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          RESULT_COUNT=$(find benchmark-results -name "*.pytorch.json" 2>/dev/null | wc -l || echo 0)
+
+          {
+            echo "### Benchmark Results"
+            echo ""
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| vLLM Branch | ${INPUT_VLLM_BRANCH} |"
+            echo "| vLLM Commit | ${HEAD_SHA:-unknown} |"
+            echo "| Models | ${MATRIX_MODELS} |"
+            echo "| Result Files | ${RESULT_COUNT} |"
+            echo "| Run ID | ${RUN_ID} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+

@@ -1,0 +1,83 @@
+name: Download override Spyre RPMs from dispatch
+description: >
+  Download override spyre RPMs from Artifactory and extract them into
+  user-space on top of the locked baseline installed by spyre-rpm-install.
+  This action is meant for integration dispatch events; torch-spyre itself
+  is built from the dispatched ref by the caller via `uv add git+...`.
+
+inputs:
+  rpm_names:
+    description: A space separated list of RPM names to download and install
+    required: true
+  rpm_location:
+    description: |
+      Full Artifactory URL to download RPMs from (e.g.
+      https://artifactory.example.com/path/to/rpms). When set, overrides the
+      ARTIFACTORY_BASE_URL + ARTIFACTORY_RPM_PATH secrets.
+    required: false
+    default: ''
+  artifactory_user:
+    description: Artifactory username
+    required: false
+    default: ''
+  artifactory_api_key:
+    description: Artifactory API key
+    required: false
+    default: ''
+  artifactory_base_url:
+    description: Artifactory base URL
+    required: false
+    default: ''
+  artifactory_rpm_path:
+    description: Artifactory RPM path
+    required: false
+    default: ''
+
+
+runs:
+  using: composite
+  steps:
+    - name: Download RPMs
+      if: ${{ inputs.rpm_names != '' }}
+      shell: bash
+      env:
+        ARTIFACTORY_USER: ${{ inputs.artifactory_user }}
+        ARTIFACTORY_TOKEN: ${{ inputs.artifactory_api_key }}
+        ARTIFACTORY_BASE_URL: ${{ inputs.artifactory_base_url }}
+        ARTIFACTORY_RPM_PATH: ${{ inputs.artifactory_rpm_path }}
+        ARTIFACTORY_LOCATION: ${{ inputs.rpm_location }}
+        DOWNLOAD_SCRIPT: .github/scripts/download_rpms.sh
+        RPM_NAMES: ${{ inputs.rpm_names }}
+        RPMS_DOWNLOAD_DIR: ${{ runner.temp }}/override-rpms
+      run: |
+        source "$HOME/.bashrc"
+        source /etc/profile.d/ibm-aiu-setup.sh
+        ls -la "$DOWNLOAD_SCRIPT"
+        "$DOWNLOAD_SCRIPT"
+
+    # Extract the downloaded RPMs into user-space, layering them on top of the
+    # locked baseline that spyre-rpm-install already extracted. The runners have
+    # no root, so `sudo dnf install` is unavailable; rpm2cpio + cpio into the
+    # same root means the LD_LIBRARY_PATH / SENTIENT_BASE_INSTALL_DIR that
+    # spyre-rpm-install wired already point at these files.
+    #
+    # spyre-rpm-install exports SENTIENT_BASE_INSTALL_DIR=<root>/opt/ibm/spyre;
+    # the RPMs contain opt/ibm/spyre/..., so we extract at <root> (that env var
+    # with the /opt/ibm/spyre suffix stripped) rather than reassuming the path.
+    - name: Install RPMs
+      if: ${{ inputs.rpm_names != '' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ -z "${SENTIENT_BASE_INSTALL_DIR:-}" ]]; then
+          echo "::error::SENTIENT_BASE_INSTALL_DIR is unset; run the spyre-rpm-install action first."
+          exit 1
+        fi
+        SPYRE_LIBS="${SENTIENT_BASE_INSTALL_DIR%/opt/ibm/spyre}"
+        RPMS_DIR="${RUNNER_TEMP}/override-rpms"
+        mkdir -p "$SPYRE_LIBS"
+        ls -la "$RPMS_DIR"
+        for rpm in "$RPMS_DIR"/*.rpm; do
+          echo "Extracting $(basename "$rpm")..."
+          rpm2cpio "$rpm" | (cd "$SPYRE_LIBS" && cpio -idm 2>/dev/null)
+        done

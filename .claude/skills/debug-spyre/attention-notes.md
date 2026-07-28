@@ -16,8 +16,16 @@ In addition to the generic table in `SKILL.md`:
 | KV alignment to bucketed length | `KV_LENGTH_ALIGNMENT=256` so the same compiled kernel is reused as KV grows |
 | Query length must be bucketed | `QUERY_CHUNK_SIZE=32`; queries are chunked into multiples of this |
 | `head_size` must be a multiple of 64 | `SpyreAttentionBackend.supports_head_size` enforces this (128-byte stick / 2 bytes for fp16) |
-| MHA / MQA head configs fail to compile | Two test parametrizations are `pytest.mark.skip`'d with `reason="Spyre compilation fails for MHA/MQA head config"`. Only GQA is exercised. |
+| MHA head config | Untested — the attention tests only exercise GQA (`_run_spyre_attn_test` hardcodes 32 q / 8 kv heads, head_size 128). MHA has not been verified. |
 | `num_seqs=1` only | The forward path assumes a single sequence at a time |
+
+**Verified working (2026-07-17, gemma-3-1b bring-up):** MQA (`num_kv_heads=1`) and
+`head_size=256` both compile and match the CPU reference on Spyre — prefill *and* decode, including
+with sliding-window attention. This contradicts an earlier note that "MHA/MQA fail to compile";
+that claim was stale. Confirmed by temporarily pointing `_run_spyre_attn_test` at gemma-3-1b's
+config (4 q / 1 kv heads, head_size 256) and running `test_spyre_attn_core` +
+`test_spyre_attn_sliding_window` on `device_spyre` — all passed. These configs are still not part of
+the committed parametrizations, so add coverage rather than assuming it exists.
 
 ## Useful test selectors (orientation only — not for `-k`)
 
@@ -25,7 +33,7 @@ These appear in current parametrize IDs. They're for reading collected node IDs;
 
 - `decode(q=1,kv=256)` / `decode(q=1,kv=1024)`
 - `prefill(q=32,kv=256)` / `prefill(q=64,kv=512)` / `prefill(q=100,kv=512)`
-- `GQA` (MHA and MQA are skipped)
+- `GQA` (the committed tests hardcode GQA 32/8; there are no MHA/MQA parametrizations)
 - `head_size(128)` / `head_size(256)`
 - `num_blocks(2048)` / `num_blocks(32768)`
 

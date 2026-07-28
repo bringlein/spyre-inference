@@ -12,27 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from unittest.mock import Mock
 
 import pytest
 import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
 )
+from spyre_testing_plugin.pytest_plugin import spyre_available
 
-
-def _spyre_available() -> bool:
-    try:
-        torch.randn(1, device=torch.device("spyre"))
-        return True
-    except Exception:
-        return False
+pytestmark = pytest.mark.attention
 
 
 @pytest.fixture()
@@ -44,7 +40,7 @@ def configure_device(request, monkeypatch):
     """
 
     device_mode = request.param
-    if device_mode == "spyre" and not _spyre_available():
+    if device_mode == "spyre" and not spyre_available():
         pytest.skip("Spyre device not available")
     return device_mode
 
@@ -90,6 +86,7 @@ def _build_metadata(
     query_start_loc: torch.Tensor,
     block_table: torch.Tensor,
     slot_mapping: torch.Tensor,
+    sliding_window: int | None = None,
 ):
     """Use the real SpyreAttentionMetadataBuilder to construct metadata."""
     from vllm.config import get_current_vllm_config
@@ -100,12 +97,22 @@ def _build_metadata(
     vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
     vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
 
-    kv_cache_spec = AttentionSpec(
-        block_size=block_size,
-        num_kv_heads=num_kv_heads,
-        head_size=head_size,
-        dtype=torch.float16,
-    )
+    if sliding_window is not None:
+        kv_cache_spec = FullAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            head_size_v=head_size,
+            dtype=torch.float16,
+            sliding_window=sliding_window,
+        )
+    else:
+        kv_cache_spec = AttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=torch.float16,
+        )
 
     builder = SpyreAttentionMetadataBuilder(
         kv_cache_spec=kv_cache_spec,
@@ -204,6 +211,23 @@ def assert_close_outliers(
         ) from e
 
 
+def _alibi_slopes(num_heads: int) -> list[float]:
+    """Standard ALiBi slope generator (Press et al. 2022).
+
+    For power-of-two head counts, uses the geometric sequence from the paper.
+    For non-power-of-two counts, interleaves the next power-of-two sequence.
+    """
+
+    def _pow2(n: int) -> list[float]:
+        start = 2 ** (-(2 ** -(math.log2(n) - 3)))
+        return [start * (start**i) for i in range(n)]
+
+    if math.log2(num_heads).is_integer():
+        return _pow2(num_heads)
+    closest = 2 ** math.floor(math.log2(num_heads))
+    return _pow2(closest) + _pow2(2 * closest)[0::2][: num_heads - closest]
+
+
 def ref_attn(
     query: torch.Tensor,
     key_cache: list[torch.Tensor],
@@ -215,6 +239,7 @@ def ref_attn(
     scale: float,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
+    alibi_slopes: list[float] | None = None,
 ) -> torch.Tensor:
     """Reference implementation of attention for validation."""
     num_seqs = len(query_lens)
@@ -255,6 +280,18 @@ def ref_attn(
             mask |= sliding_window_mask
         if soft_cap is not None and soft_cap > 0:
             attn = soft_cap * torch.tanh(attn / soft_cap)
+        if alibi_slopes is not None:
+            # bias[h, q, k] = slope[h] * (k_abs_pos - q_abs_pos), applied before mask.
+            # Under strict causal decoding the q_abs_pos term cancels through
+            # softmax, so any per-row-constant simplification is equivalent —
+            # keep the full form here for clarity in the reference.
+            slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
+            context_len = kv_len - query_len
+            q_abs = torch.arange(query_len, dtype=torch.float32) + context_len
+            kv_abs = torch.arange(kv_len, dtype=torch.float32)
+            rel = kv_abs.unsqueeze(0) - q_abs.unsqueeze(1)  # [query_len, kv_len]
+            bias = slopes.view(-1, 1, 1) * rel.unsqueeze(0)  # [num_heads, q, k]
+            attn = attn + bias
         attn.masked_fill_(mask, float("-inf"))
         attn = torch.softmax(attn, dim=-1).to(v.dtype)
         out = torch.einsum("hqk,khd->qhd", attn, v)
@@ -265,99 +302,32 @@ def ref_attn(
     return torch.cat(outputs, dim=0)
 
 
-@pytest.mark.parametrize(
-    "configure_device",
-    [
-        pytest.param("cpu", id="device_cpu"),
-        pytest.param("spyre", id="device_spyre"),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "configure_compilation",
-    [
-        pytest.param("NONE", id="compilation_NONE"),
-        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
-    ],
-    indirect=True,
-)
-@pytest.mark.parametrize(
-    "seq_lens",
-    [
-        pytest.param([(1, 1024)], id="decode(q=1,kv=1024)"),
-        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
-        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
-        pytest.param([(64, 512)], id="prefill(q=64,kv=512)"),
-        pytest.param([(100, 512)], id="prefill(q=100,kv=512)"),
-        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
-        pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
-        pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
-    ],
-)
-@pytest.mark.parametrize(
-    "num_heads",
-    [
-        pytest.param((32, 8), id="GQA"),
-        # pytest.param((32, 32), id="MHA"),
-        # pytest.param((32, 1), id="MQA"),
-    ],
-)
-@pytest.mark.parametrize(
-    "head_size",
-    [
-        pytest.param(128, id="head_size(128)"),
-        # pytest.param(256, id="head_size(256)"),
-    ],
-)
-@pytest.mark.parametrize(
-    "block_size",
-    [
-        # Valid block_size values: must be multiples of 64 for Spyre stick alignment.
-        # See: https://github.com/torch-spyre/spyre-inference/issues/239
-        pytest.param(64, id="block_size(64)"),
-        pytest.param(128, id="block_size(128)"),
-        pytest.param(256, id="block_size(256)"),
-    ],
-)
-@pytest.mark.parametrize("sliding_window", [None])
-@pytest.mark.parametrize(
-    "dtype",
-    [
-        pytest.param(torch.float16, id="dtype(fp16)"),
-    ],
-)
-@pytest.mark.parametrize("soft_cap", [None])
-@pytest.mark.parametrize(
-    "num_blocks",
-    [
-        # pytest.param(2048, id="num_blocks(2048)"),
-        pytest.param(256, id="num_blocks(256)"),
-    ],
-)
 @torch.inference_mode()
-def test_spyre_attn(
-    default_vllm_config,
-    num_blocks: int,
-    soft_cap: float | None,
-    dtype: torch.dtype,
-    sliding_window: int | None,
-    block_size: int,
-    head_size: int,
-    num_heads: tuple[int, int],
+def _run_spyre_attn_test(
     seq_lens: list[tuple[int, int]],
+    block_size: int,
+    sliding_window: int | None,
     configure_compilation: str,
     configure_device: str,
+    use_alibi: bool = False,
+    soft_cap: float | None = None,
+    num_query_heads: int = 32,
+    num_kv_heads: int = 8,
 ) -> None:
-    """Validate SpyreAttentionImpl against a reference implementation."""
+    """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # TODO: STOCK_TORCH_COMPILE + device_spyre, currently fails with
     # "missing device_tensor_layout on graph input arg0_1"
     if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "spyre":
         pytest.skip("STOCK + device_spyre, currently fails.")
 
-    num_query_heads, num_kv_heads = num_heads
-    # only for preparation, actual device is set via `configure_device`
+    head_size = 128
+    num_blocks = 256
+    dtype = torch.float16
+
     torch.set_default_device("cpu")
     set_random_seed(0)
+
+    alibi_slopes = _alibi_slopes(num_query_heads) if use_alibi else None
 
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
@@ -371,7 +341,6 @@ def test_spyre_attn(
     value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
 
     cache_device = torch.device(configure_device)
-    # list based creation here, update once this changes
     k_pages_cpu: list[torch.Tensor] = [
         torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
     ]
@@ -389,7 +358,8 @@ def test_spyre_attn(
         0, num_blocks, (num_seqs, max_num_blocks_per_seq), dtype=torch.int32
     )
 
-    # Pre-populate KV cache with historical context (on CPU)
+    slot_mapping = []
+    q_offset = 0
     for seq_idx in range(num_seqs):
         query_len = query_lens[seq_idx]
         kv_len = kv_lens[seq_idx]
@@ -398,26 +368,26 @@ def test_spyre_attn(
             historical_keys = torch.randn(historical_len, num_kv_heads, head_size, dtype=dtype)
             historical_values = torch.randn(historical_len, num_kv_heads, head_size, dtype=dtype)
             for token_idx in range(historical_len):
-                block_idx = token_idx // block_size
+                actual_block = block_tables[seq_idx, token_idx // block_size].item()
                 block_offset = token_idx % block_size
-                actual_block = block_tables[seq_idx, block_idx].item()
                 k_pages_cpu[actual_block][:, block_offset, :] = historical_keys[token_idx]
                 v_pages_cpu[actual_block][:, block_offset, :] = historical_values[token_idx]
+        for token_idx in range(historical_len, kv_len):
+            block_idx = token_idx // block_size
+            block_offset = token_idx % block_size
+            actual_block = block_tables[seq_idx, block_idx].item()
+            k_pages_cpu[actual_block][:, block_offset, :] = key[
+                q_offset + token_idx - historical_len
+            ]
+            v_pages_cpu[actual_block][:, block_offset, :] = value[
+                q_offset + token_idx - historical_len
+            ]
+            slot_mapping.append(actual_block * block_size + block_offset)
+        q_offset += query_len
+    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    # Transfer populated pages to device
     k_pages: list[torch.Tensor] = [p.to(cache_device) for p in k_pages_cpu]
     v_pages: list[torch.Tensor] = [p.to(cache_device) for p in v_pages_cpu]
-
-    # Create slot mapping for new query tokens
-    slot_mapping = []
-    for seq_idx in range(num_seqs):
-        query_len = query_lens[seq_idx]
-        kv_len = kv_lens[seq_idx]
-        for token_idx in range(query_len):
-            pos = kv_len - query_len + token_idx
-            actual_block = block_tables[seq_idx, pos // block_size].item()
-            slot_mapping.append(actual_block * block_size + pos % block_size)
-    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -428,6 +398,7 @@ def test_spyre_attn(
         query_start_loc=cu_query_lens,
         block_table=block_tables,
         slot_mapping=slot_mapping,
+        sliding_window=sliding_window,
     )
 
     attn_impl = SpyreAttentionImpl(
@@ -435,7 +406,7 @@ def test_spyre_attn(
         head_size=head_size,
         scale=scale,
         num_kv_heads=num_kv_heads,
-        alibi_slopes=None,
+        alibi_slopes=alibi_slopes,
         sliding_window=sliding_window,
         kv_cache_dtype="auto",
         logits_soft_cap=soft_cap,
@@ -443,10 +414,6 @@ def test_spyre_attn(
 
     output = torch.empty_like(query).to(cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
-    # Note: attn_impl.forward() internally calls _reshape_and_cache() to write
-    # the new K/V tokens into the cache, so this test exercises both the cache
-    # writing and attention computation paths. TODO: Add a dedicated unit test
-    # for _reshape_and_cache to independently verify cache writes.
     attn_impl.forward(
         layer=None,
         query=query,
@@ -468,6 +435,7 @@ def test_spyre_attn(
         scale=scale,
         sliding_window=sliding_window,
         soft_cap=soft_cap,
+        alibi_slopes=alibi_slopes,
     )
 
     if max(query_lens) >= 32:
@@ -475,8 +443,6 @@ def test_spyre_attn(
     else:
         atol, rtol = 0.2, 0.2
 
-    # Allow a small number of outlier elements to exceed the base tolerance,
-    # which can happen due to nondeterministic hardware optimizations.
     assert_close_outliers(
         output.to("cpu"),
         ref_output,
@@ -485,6 +451,329 @@ def test_spyre_attn(
         rtol=rtol,
         outlier_atol=atol * 2,
         outlier_rtol=rtol * 2,
+    )
+
+    # Release Spyre DMA mappings eagerly. Python doesn't free the KV-page
+    # tensors between tests until GC runs, but the Spyre VFIO driver keeps
+    # DMA regions mapped until the storage is actually released. Accumulated
+    # mappings across many tests in one pytest process can exhaust the VFIO
+    # address-space table (RAS::VFIO::MapDMAFailed).
+    if configure_device == "spyre":
+        del k_pages, v_pages, kv_cache, output
+        import gc
+
+        gc.collect()
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 512)], id="decode(q=1,kv=512)"),
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(33, 96)], id="prefill(q=33,kv=96)"),
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+        pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
+        pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
+    ],
+)
+def test_spyre_attn_core(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Attention correctness across execution modes with representative config."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 64)], id="decode(q=1,kv=64)"),
+        pytest.param([(1, 512)], id="decode(q=1,kv=512)"),
+        pytest.param([(32, 288)], id="prefill(q=32,kv=288)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "block_size",
+    [
+        pytest.param(64, id="block_size(64)"),
+        pytest.param(128, id="block_size(128)"),
+        pytest.param(256, id="block_size(256)"),
+    ],
+)
+def test_spyre_attn_block_sizes(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    block_size: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Page tiling correctness across block sizes."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=block_size,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 4)], id="decode(q=1,kv=4)"),
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "sliding_window",
+    [
+        pytest.param(4, id="swa_4"),
+        pytest.param(16, id="swa_16"),
+    ],
+)
+def test_spyre_attn_sliding_window(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    sliding_window: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Sliding window mask correctness."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+    ],
+)
+def test_spyre_attn_alibi(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """ALiBi positional bias correctness."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        use_alibi=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "soft_cap",
+    [
+        pytest.param(50.0, id="soft_cap(50)"),
+    ],
+)
+def test_spyre_attn_soft_cap(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    soft_cap: float,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Logits soft-cap correctness."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        soft_cap=soft_cap,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+    ],
+)
+def test_spyre_attn_mha(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """MHA correctness: num_query_heads == num_kv_heads."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=8,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+    ],
+)
+def test_spyre_attn_mqa(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """MQA correctness: num_kv_heads == 1."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=8,
+        num_kv_heads=1,
     )
 
 
@@ -558,3 +847,198 @@ def test_block_size_validation():
             device=torch.device("cpu"),
         )
         assert builder.block_size == block_size
+
+
+def test_sliding_window_none_equivalence(default_vllm_config):
+    """Verify sliding_window=None produces identical results to full attention.
+
+    This is a regression test to ensure the sliding window code path doesn't
+    affect the standard full attention behavior.
+    """
+
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    num_query_heads, num_kv_heads = 32, 8
+    head_size = 128
+    block_size = 64
+    num_blocks = 256
+    dtype = torch.float16
+
+    # Single sequence: query_len=32, kv_len=256
+    query_len, kv_len = 32, 256
+
+    k_pages_cpu = [
+        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
+    ]
+    v_pages_cpu = [
+        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
+    ]
+
+    # Pre-populate KV cache
+    for i in range(kv_len):
+        block_idx = i // block_size
+        block_offset = i % block_size
+        k_pages_cpu[block_idx][:, block_offset, :] = torch.randn(
+            num_kv_heads, head_size, dtype=dtype
+        )
+        v_pages_cpu[block_idx][:, block_offset, :] = torch.randn(
+            num_kv_heads, head_size, dtype=dtype
+        )
+
+    cu_query_lens = torch.tensor([0, query_len], dtype=torch.int32)
+    kv_lens_tensor = torch.tensor([kv_len], dtype=torch.int32)
+    max_num_blocks = (kv_len + block_size - 1) // block_size
+    block_tables = torch.zeros((1, max_num_blocks), dtype=torch.int32)
+    block_tables[0, : (kv_len + block_size - 1) // block_size] = torch.arange(
+        (kv_len + block_size - 1) // block_size
+    )
+
+    slot_mapping = torch.arange(query_len, dtype=torch.int64) + (kv_len - query_len)
+
+    # Build metadata with sliding_window=None
+    metadata_none = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=kv_lens_tensor,
+        query_start_loc=cu_query_lens,
+        block_table=block_tables,
+        slot_mapping=slot_mapping,
+        sliding_window=None,
+    )
+
+    # Build metadata with sliding_window=256 (larger than seq_len, effectively None)
+    metadata_swa = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=kv_lens_tensor,
+        query_start_loc=cu_query_lens,
+        block_table=block_tables,
+        slot_mapping=slot_mapping,
+        sliding_window=256,
+    )
+
+    # Compare masks - they should be identical when window doesn't bind
+    mask_none = metadata_none.attention_mask_tiles[0][0]
+    mask_swa = metadata_swa.attention_mask_tiles[0][0]
+
+    assert torch.equal(mask_none, mask_swa), (
+        "Masks differ when sliding_window >= seq_len. "
+        f"Max diff: {(mask_none - mask_swa).abs().max().item()}"
+    )
+
+
+def test_sliding_window_boundary_conditions(default_vllm_config):
+    """Test sliding window at boundary conditions.
+
+    Tests:
+    - seq_len == sliding_window (window exactly fits)
+    - seq_len == sliding_window + 1 (one token beyond window)
+    - Mixed batch with different seq_lens
+    """
+
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    num_query_heads, num_kv_heads = 8, 2
+    head_size = 128
+    block_size = 64
+    sliding_window = 4
+
+    # Test 1: seq_len == sliding_window (exactly 4 tokens)
+    kv_len_eq = sliding_window
+    query_len_eq = 1  # decode step
+    context_len_eq = kv_len_eq - query_len_eq  # 3
+
+    seq_lens_eq = torch.tensor([kv_len_eq], dtype=torch.int32)
+    query_start_loc_eq = torch.tensor([0, query_len_eq], dtype=torch.int32)
+    block_tables_eq = torch.zeros((1, 1), dtype=torch.int32)
+    slot_mapping_eq = torch.tensor([context_len_eq], dtype=torch.int64)
+
+    metadata_eq = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=seq_lens_eq,
+        query_start_loc=query_start_loc_eq,
+        block_table=block_tables_eq,
+        slot_mapping=slot_mapping_eq,
+        sliding_window=sliding_window,
+    )
+
+    # Query at position 3 (absolute) should attend to [0, 1, 2, 3] - all 4 tokens
+    mask_eq = metadata_eq.attention_mask_tiles[0][0]
+    attended_eq = (mask_eq[0] == 0).nonzero().flatten().tolist()
+    assert attended_eq == [0, 1, 2, 3], f"Expected [0,1,2,3], got {attended_eq}"
+
+    # Test 2: seq_len == sliding_window + 1 (5 tokens, window binds)
+    kv_len_gt = sliding_window + 1
+    query_len_gt = 1  # decode step
+    context_len_gt = kv_len_gt - query_len_gt  # 4
+
+    seq_lens_gt = torch.tensor([kv_len_gt], dtype=torch.int32)
+    query_start_loc_gt = torch.tensor([0, query_len_gt], dtype=torch.int32)
+    block_tables_gt = torch.zeros((1, 1), dtype=torch.int32)
+    slot_mapping_gt = torch.tensor([context_len_gt], dtype=torch.int64)
+
+    metadata_gt = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=seq_lens_gt,
+        query_start_loc=query_start_loc_gt,
+        block_table=block_tables_gt,
+        slot_mapping=slot_mapping_gt,
+        sliding_window=sliding_window,
+    )
+
+    # Query at position 4 (absolute) should attend to [1, 2, 3, 4] - 4 tokens
+    mask_gt = metadata_gt.attention_mask_tiles[0][0]
+    attended_gt = (mask_gt[0] == 0).nonzero().flatten().tolist()
+    assert attended_gt == [1, 2, 3, 4], f"Expected [1,2,3,4], got {attended_gt}"
+
+    # Test 3: Mixed batch - one seq within window, one beyond
+    kv_len_mixed = [sliding_window, sliding_window + 5]  # [4, 9]
+    context_lens_mixed = [3, 8]
+
+    num_seqs_mixed = 2
+    seq_lens_mixed = torch.tensor(kv_len_mixed, dtype=torch.int32)
+    query_start_loc_mixed = torch.tensor([0, 1, 2], dtype=torch.int32)
+    max_blocks_mixed = (max(kv_len_mixed) + block_size - 1) // block_size
+    block_tables_mixed = torch.zeros((num_seqs_mixed, max_blocks_mixed), dtype=torch.int32)
+    for s in range(num_seqs_mixed):
+        block_tables_mixed[s, : (kv_len_mixed[s] + block_size - 1) // block_size] = torch.arange(
+            (kv_len_mixed[s] + block_size - 1) // block_size
+        )
+
+    slot_mapping_mixed = torch.tensor(
+        [context_lens_mixed[0], context_lens_mixed[1]], dtype=torch.int64
+    )
+
+    metadata_mixed = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=seq_lens_mixed,
+        query_start_loc=query_start_loc_mixed,
+        block_table=block_tables_mixed,
+        slot_mapping=slot_mapping_mixed,
+        sliding_window=sliding_window,
+    )
+
+    # Seq 0 (kv_len=4): query at position 3, attends to [0, 1, 2, 3]
+    mask_mixed_0 = metadata_mixed.attention_mask_tiles[0][0]
+    attended_mixed_0 = (mask_mixed_0[0] == 0).nonzero().flatten().tolist()
+    assert attended_mixed_0 == [0, 1, 2, 3], f"Seq 0: expected [0,1,2,3], got {attended_mixed_0}"
+
+    # Seq 1 (kv_len=9): query at position 8, attends to [5, 6, 7, 8]
+    mask_mixed_1 = metadata_mixed.attention_mask_tiles[1][0]
+    attended_mixed_1 = (mask_mixed_1[0] == 0).nonzero().flatten().tolist()
+    assert attended_mixed_1 == [5, 6, 7, 8], f"Seq 1: expected [5,6,7,8], got {attended_mixed_1}"

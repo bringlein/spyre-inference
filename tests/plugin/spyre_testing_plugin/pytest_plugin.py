@@ -55,6 +55,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 import torch.distributed as dist
 import torch.testing
 
@@ -81,6 +82,41 @@ _YAML_PATH = Path(__file__).parent / _YAML_FILENAME
 
 # Global terminal reporter for pytest-aware logging
 _terminal_reporter = None
+
+
+# ---------------------------------------------------------------------------
+# Test Utilities
+# ---------------------------------------------------------------------------
+
+
+def spyre_available() -> bool:
+    """Check if Spyre device is available for testing.
+
+    Returns:
+        True if a Spyre device can be allocated, False otherwise.
+    """
+    try:
+        torch.randn(1, device=torch.device("spyre"))
+        return True
+    except Exception:
+        return False
+
+
+def spyre_device_count() -> int:
+    """Return the number of visible Spyre cards, or 0 if unavailable.
+
+    Reads AIU_WORLD_SIZE (set by the Spyre runtime environment when
+    cards are visible) instead of touching the Spyre runtime, so
+    `uses_subprocess` tests don't import torch_spyre in the main
+    pytest process.
+
+    Returns:
+        Number of visible Spyre devices, or 0 if unavailable.
+    """
+    try:
+        return int(os.environ.get("AIU_WORLD_SIZE", "0"))
+    except ValueError:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -204,21 +240,29 @@ def _extract_vllm_commit_from_pyproject() -> str:
     Raises FileNotFoundError if pyproject.toml is missing, or KeyError
     if the expected source entry is not found.
     """
-    # Look for pyproject.toml at repo root
     repo_root_dir = Path(__file__).parent.parent.parent.parent
     pyproject_path = repo_root_dir / "pyproject.toml"
     if not pyproject_path.exists():
         raise FileNotFoundError(f"pyproject.toml not found in {repo_root_dir}")
 
-    content = pyproject_path.read_text()
-    # Look for vllm source with git and rev
-    # Pattern: vllm = { git = "...", rev = "commit_sha_or_semver_tag" }
-    match = re.search(
-        r'vllm\s*=\s*\{\s*git\s*=\s*"[^"]+"\s*,\s*rev\s*=\s*"([0-9a-f]{7,40}|v\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?)"\s*\}',
-        content,
-    )
-    if match:
-        return match.group(1)
+    with open(pyproject_path, "rb") as f:
+        data = tomllib.load(f)
+
+    try:
+        vllm_source = data["tool"]["uv"]["sources"]["vllm"]
+    except KeyError as e:
+        raise KeyError(
+            "Ensure vllm is specified with 'rev' in pyproject.toml"
+            f" [tool.uv.sources]: missing key {e}"
+        ) from e
+
+    # Handle both a single source dict and a list of sources (e.g. index + git fallback)
+    if isinstance(vllm_source, list):
+        for source in vllm_source:
+            if isinstance(source, dict) and "git" in source and "rev" in source:
+                return source["rev"]
+    elif isinstance(vllm_source, dict) and "git" in vllm_source and "rev" in vllm_source:
+        return vllm_source["rev"]
 
     raise KeyError("Ensure vllm is specified with 'rev' in pyproject.toml [tool.uv.sources]")
 
@@ -388,7 +432,7 @@ def pytest_configure(config):
     _terminal_reporter = config.pluginmanager.get_plugin("terminalreporter")
 
     # Set env vars BEFORE any vllm imports
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
     # Load plugins early to register custom ops before test modules import RMSNorm
@@ -545,6 +589,10 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
             item.add_marker(pytest.mark.skip(reason="param skipped"))
             continue
 
+        if allow_entry.mode == "skip":
+            item.add_marker(pytest.mark.skip(reason=f"skipped by {_YAML_FILENAME}"))
+            continue
+
         if allow_entry.mode == "xfail":
             item.add_marker(pytest.mark.xfail(strict=False))
         elif allow_entry.mode == "xfail_strict":
@@ -630,14 +678,25 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
         return
 
     for po in allow_entry.param_overrides:
-        if po.param_name not in metafunc.fixturenames:
+        # Support both single-name keys and comma-joined tuple-parametrize keys
+        # (e.g. `@pytest.mark.parametrize("a, b, c", [(1, 2, 3), ...])`).
+        sub_names = [n.strip() for n in po.param_name.split(",")]
+        if any(n not in metafunc.fixturenames for n in sub_names):
             continue
         for i, marker in enumerate(metafunc.definition.own_markers):
-            if marker.name == "parametrize" and marker.args[0] == po.param_name:
-                metafunc.definition.own_markers[i] = pytest.mark.parametrize(
-                    po.param_name, [_convert_yaml_value(v) for v in po.values]
-                ).mark
-                break
+            if marker.name != "parametrize":
+                continue
+            marker_names = [n.strip() for n in marker.args[0].split(",")]
+            if marker_names != sub_names:
+                continue
+            if len(sub_names) > 1:
+                new_values = [tuple(_convert_yaml_value(v) for v in row) for row in po.values]
+            else:
+                new_values = [_convert_yaml_value(v) for v in po.values]
+            metafunc.definition.own_markers[i] = pytest.mark.parametrize(
+                po.param_name, new_values
+            ).mark
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -659,7 +718,7 @@ def _spyre_session_config():
     plugin initialization. Tests that need a different config can still enter
     their own set_current_vllm_config context (nesting is safe).
     """
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
     from vllm.plugins import load_general_plugins
@@ -831,12 +890,6 @@ def run_tp_probe(pytestconfig):
     return _run
 
 
-@pytest.fixture()
-def should_do_global_cleanup_after_test():
-    """Skip global cleanup for Spyre - torch.accelerator.empty_cache() doesn't work yet."""
-    return False
-
-
 @pytest.fixture(autouse=True)
 def relax_torch_tolerances(request, monkeypatch):
     """Relax torch.testing.assert_close tolerances for upstream tests.
@@ -910,11 +963,11 @@ def patch_backend_list(request, monkeypatch):
         sliding_window=None,
     ):
         if backend == AttentionBackendEnum.CUSTOM:
-            # [2, num_blocks, block_size, num_kv_heads, head_size]
+            # [num_blocks, 2, block_size, num_kv_heads, head_size]
             #   -> per-side [num_blocks, num_kv_heads, block_size, head_size]
             #   -> list of num_blocks tensors of [num_kv_heads, block_size, head_size]
-            k_blocks = kv_cache[0].transpose(1, 2).contiguous()
-            v_blocks = kv_cache[1].transpose(1, 2).contiguous()
+            k_blocks = kv_cache[:, 0].transpose(1, 2).contiguous()
+            v_blocks = kv_cache[:, 1].transpose(1, 2).contiguous()
             kv_cache = (list(k_blocks.unbind(0)), list(v_blocks.unbind(0)))
         return orig_run_attention_backend(
             backend,

@@ -12,25 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre-specific SiluAndMul implementation using out-of-tree (OOT) registration.
-
-This module provides a custom SiluAndMul (SwiGLU) activation layer for
-IBM's Spyre device, replacing the upstream vLLM implementation from
-vllm/model_executor/layers/activation.py when instantiated.
-
-Architecture:
-    - OOT Registration: @SiluAndMul.register_oot() replaces upstream at instantiation
-    - forward_oot(): Entry point for OOT dispatch, fully transparent to the outer
-      torch.compile graph (no opaque custom-op boundary)
-    - CPU slicing workaround: Slice on CPU, transfer to Spyre separately to avoid
-      memory corruption from slicing Spyre tensors directly
-
-Output Shape Note:
-    input shape: [..., 2*d] -> output shape: [..., d]
-
-References:
-    - Upstream SiluAndMul: vllm/model_executor/layers/activation.py
-"""
+"""Spyre-specific SiluAndMul implementation"""
 
 import torch
 import torch.nn.functional as F
@@ -45,48 +27,28 @@ logger = init_logger(__name__)
 
 @SiluAndMul.register_oot(name="SiluAndMul")
 class SpyreSiluAndMul(SiluAndMul):
-    """Out-of-tree (OOT) SiluAndMul implementation for IBM's Spyre device.
-
-    This replaces the upstream vLLM SiluAndMul (vllm/model_executor/layers/activation.py)
-    when instantiated, providing Spyre-specific optimizations and device handling.
-
-    Computes: x -> silu(x[..., :d]) * x[..., d:] where d = x.shape[-1] // 2
-
-    Preserves input dtype and device. Slices on CPU to avoid Spyre slicing bugs.
-    """
+    """Out-of-tree (OOT) SiluAndMul implementation for IBM's Spyre device."""
 
     def __init__(self, *args, **kwargs):
         """Initialize SpyreSiluAndMul layer."""
         super().__init__(*args, **kwargs)
 
-    def forward_oot(self, x: torch.Tensor) -> torch.Tensor:
-        """Spyre-optimized SiLU and multiply activation (SwiGLU).
+    def forward_oot(self, x) -> torch.Tensor:
+        """SwiGLU: silu(gate) * up, output shape [..., d].
 
-        Computes silu(x[..., :d]) * x[..., d:] where d = x.shape[-1] // 2.
-
-        Preserves the input's device and dtype. Slices on CPU to work around
-        Spyre's slicing bug which causes memory corruption and crashes.
-
-        Args:
-            x: Input tensor of shape [..., 2*d] containing concatenated gate halves.
-
-        Returns:
-            Activated output tensor of shape [..., d] with same device and dtype as input.
+        `x` is either a pre-split gate/up pair (a SplitSiluAndMul from an
+        un-fused gate_up_proj, see unfuse.py) or a fused [..., 2*d] tensor.
+        The fused path only runs for layers unfuse left alone (e.g. quantized).
         """
-        original_device = x.device
-
-        # Move to CPU if on Spyre (slicing Spyre tensors causes corruption).
-        if x.device.type == "spyre":
+        if not isinstance(x, torch.Tensor):
+            # Unfused path: gate/up already split, both contiguous on device.
+            x1, x2 = x
+        else:
+            # Fused path: slice on CPU — slicing a Spyre tensor corrupts memory,
+            # and non-contiguous slices corrupt again on transfer back.
+            original_device = x.device
             x = convert(x, device="cpu")
-
-        # Slice and make contiguous before transferring to Spyre.
-        # Non-contiguous slices get corrupted during transfer to Spyre!
-        d = x.shape[-1] // 2
-        x1 = x[..., :d].contiguous()
-        x2 = x[..., d:].contiguous()
-
-        # Transfer contiguous slices back to original device.
-        x1 = convert(x1, device=original_device)
-        x2 = convert(x2, device=original_device)
-
+            d = x.shape[-1] // 2
+            x1 = convert(x[..., :d].contiguous(), device=original_device)
+            x2 = convert(x[..., d:].contiguous(), device=original_device)
         return F.silu(x1) * x2

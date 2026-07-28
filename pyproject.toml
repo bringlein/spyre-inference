@@ -12,11 +12,12 @@ readme = "README.md"
 license = {text = "Apache-2.0"}
 dependencies = [
     "torch-spyre",
-    "vllm",
+    "vllm>=0.25.1,<0.26",
 
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
     "torch",
+    "hf-adapters-spyre"
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -32,6 +33,7 @@ spyre_inference = "spyre_inference:register"
 
 [project.entry-points."vllm.general_plugins"]
 spyre_inference_ops = "spyre_inference:register_ops"
+spyre_inference_hf_adaptor = "spyre_inference:register_hf_adapters"
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
@@ -62,6 +64,9 @@ override-dependencies = [
     # TODO: This will be required in the future for VLM support via vllm
     "torchvision; sys_platform == 'never'",
 
+    # (transformers imports it at module level via loss_rnnt.py)
+    "torchaudio; sys_platform == 'never'",
+
     # Skip packages on s390x and ppc64le that are expected to be pre-installed
     "vllm ; platform_machine not in 's390x, ppc64le'",
     "ray; platform_machine not in 's390x, ppc64le'",
@@ -76,9 +81,6 @@ override-dependencies = [
     # The range here should match the numba dependency
     "numpy>=1.24,<2.3",
 
-    # opencv-python-headless==4.13.0.90 has a packaging bug that incorrectly depends on libxcb.so.1,
-    # causing import failure on headless Linux systems.
-    "opencv-python-headless==4.12.0.88",
 
     # setuptools is specified as a runtime dep by vllm, make sure it's patched for CVEs
     "setuptools>=82",
@@ -87,19 +89,23 @@ override-dependencies = [
     "requests>=2.32.4",
 
 ]
-# This adds constraints to all dependent build environments, which will ensure everything is built
-# with the same version of torch. This CANNOT conflict with a package's existing build dependencies
 build-constraint-dependencies = ["torch==2.11.0"]
-# This ensures that we build the cpu backend for vLLM
+# This ensures that we build vLLM with no device-specific C kernels (empty backend).
+# This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency
+# on vllm._C (which provides CPU-optimized ops we don't need — Spyre has its own).
 # The `CMAKE_ARGS="--fresh"` ensures that cmake doesn't cache binary paths from ephemeral build environments
-extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "cpu", CMAKE_ARGS = "--fresh" } }
+extra-build-variables = { vllm = { VLLM_TARGET_DEVICE = "empty", CMAKE_ARGS = "--fresh" } }
 
 
 # vLLM and torch-spyre must be pulled from github to be built from source
 # NB: torch-spyre can only be compiled where `sendnn` is available
 [tool.uv.sources]
-vllm = { git = "https://github.com/vllm-project/vllm", rev = "v0.20.1" }
-torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "a6baa9c73b2de0f1b199c2c567d8609720bcf5a8" }
+vllm = [
+  # Built from source with VLLM_TARGET_DEVICE=empty (no C kernels).
+  { git = "https://github.com/vllm-project/vllm", rev = "v0.25.1" },
+]
+torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "7073e9cf5b137ea576808aafc3f702babc2aafd4" }
+hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
   { index = "pytorch-cpu" },
 ]
@@ -113,12 +119,8 @@ spyre-testing-plugin = { workspace = true }
 members = ["tests/plugin"]
 
 # vllm specifies "common" build dependencies in pyproject.toml, while specific requirements for
-# cpu builds are specified here:
-# See https://github.com/vllm-project/vllm/blob/v0.15.1/requirements/cpu-build.txt
-# In the future, we may need to use this section to specify extra dependencies required to build
-# vllm from source for the cpu backend.
-# NB: This section CANNOT be used to override dependencies to a conflicting version. For example,
-# you cannot add torch==2.10.0 if vllm's build dependencies already specify torch>=2.11.0
+# building from source are specified here. The empty backend has minimal build deps.
+# NB: This section CANNOT be used to override dependencies to a conflicting version.
 # [tool.uv.extra-build-dependencies]
 # vllm = [
 #     "ninja",
@@ -126,7 +128,7 @@ members = ["tests/plugin"]
 
 # The pytorch-cpu index here ensures we always pull the cpu version of torch everywhere
 # The `explicit=true` setting means this index will only be used for packages that we explicitly set
-# it for in `tool.uv.sources`. This is important to avoid requiring the use of 
+# it for in `tool.uv.sources`. This is important to avoid requiring the use of
 # `--index-strategy unsafe-best-match`
 [[tool.uv.index]]
 name = "pytorch-cpu"
@@ -134,9 +136,6 @@ url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.ty.rules]
-possibly-missing-attribute = "ignore"
-# TODO: re-enable once vllm/torch-spyre imports resolve in CI.
-unresolved-import = "ignore"
 # TODO: re-enable after fixing subclass attribute lookups in custom_ops/linear.py.
 unresolved-attribute = "ignore"
 
@@ -226,6 +225,9 @@ filterwarnings = [
 markers = [
     "distributed: Tests requiring multiple spyre cards",
     "upstream: Tests coming from upstream vLLM",
+    "attention: SpyreAttentionImpl tests (tests/test_spyre_attn.py); slow, runs in its own CI job",
+    "rotary: Spyre RoPE custom-op tests (tests/test_rotary_embedding.py)",
+    "fp8: FP8 quantization tests (tests/test_fp8.py)",
 ]
 # --8<-- [end:test-markers-definition]
 
