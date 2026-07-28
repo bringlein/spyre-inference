@@ -276,21 +276,18 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
 
 def _create_compilable_page_attn(
     num_blocks: int,
-    num_query_tokens: int,
-    num_queries_per_kv: int,
+    padded_query_len: int,
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
-    Dynamo unrolls the loop because num_blocks, num_query_tokens, has_alibi, and
+    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi, and
     logits_soft_cap are closure constants.
-    The kernel is specialized for a fixed number of query tokens
-    (e.g., 1 for decode, 4 for prefill).
     """
 
     def specialized_paged_attn_kernel(
-        q_for_matmul,
+        q,
         k_pages,
         v_pages,
         page_indices,
@@ -299,43 +296,41 @@ def _create_compilable_page_attn(
         alibi_bias_tiles=None,
     ):
         """
-        This kernel specializes for num_blocks and num_query_tokens.
-
-        All intermediate tensors stay in [KV, N*QPK, ...] format to avoid
-        transpose/permute+contiguous on Spyre (which silently corrupts data).
-        The caller builds q_for_matmul and converts the result on CPU.
+        This kernels specializes for num_blocks and padded_query_len.
 
         Expected shapes:
-            q_for_matmul: [num_kv_heads, N*QPK, head_size] — pre-built on CPU, contiguous
             k_pages: list of [num_kv_heads, block_size, head_size]
             v_pages: list of [num_kv_heads, block_size, head_size]
             page_indices: [num_blocks]
-            mask_tiles: list of num_blocks tensors, each [N*QPK, block_size]
-                (pre-expanded: each query token's mask repeated QPK times)
-            alibi_bias_tiles: list of num_blocks tensors, each
-                [num_kv_heads, N*QPK, block_size] (only when has_alibi=True;
-                None otherwise). The bias is constant across query tokens
-                because softmax absorbs per-query-row constants — see the
-                derivation at the bias-tile construction site in
+            mask_tiles: [num_blocks]
+            alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size]
+                (only when has_alibi=True; None otherwise). The query-axis dim
+                is 1 because softmax absorbs per-query-row constants — see
+                the derivation at the bias-tile construction site in
                 _online_softmax_attention.
         """
+
         tile_max = None
         tile_sum = None
         tile_output = None
 
         for i in range(num_blocks):
             page_idx = page_indices[i]
-            mask_tile = mask_tiles[i]  # [N*QPK, block_size]
+            # Syntax with views and indirect access
+            # (i.e. instead of _indirect_matmul_mock)
+            # k_page = k_pages[page_idx]
+            # v_page = v_pages[page_idx]
+            # k_page_4d = k_page.unsqueeze(1)
+            # v_page_4d = v_page.unsqueeze(1)
 
-            # Get K/V page: [KV, B, D]
-            k_page = k_pages[page_idx]
-            v_page = v_pages[page_idx]
+            mask_tile = mask_tiles[i]
 
-            # k_page: [KV, B, D] -> [KV, D, B] for matmul
-            k_transposed = k_page.transpose(-2, -1)
-
-            # scores: [KV, N*QPK, D] @ [KV, D, B] = [KV, N*QPK, B]
-            scores = torch.bmm(q_for_matmul, k_transposed)
+            # scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+            # NOTE: for true "varlen" layout, q would be
+            # an indirect access too (avoided here for simplicity...)
+            scores = _indirect_matmul_mock(
+                q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
+            )
             scores *= scale
             if logits_soft_cap > 0.0:
                 # Pull logits into (-cap, +cap) before the mask add so masked
@@ -348,20 +343,19 @@ def _create_compilable_page_attn(
                 # bias cannot un-mask them.
                 assert alibi_bias_tiles is not None
                 scores = scores + alibi_bias_tiles[i]
-
-            # Mask: [N*QPK, B] -> [1, N*QPK, B] for broadcasting with [KV, N*QPK, B]
-            scores = scores + mask_tile.unsqueeze(0)
-
-            scores_max = torch.amax(scores, dim=-1, keepdim=True)  # [KV, N*QPK, 1]
+            scores = scores + mask_tile
+            scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
             if i == 0:
                 tile_max = scores_max
-                tile_probs = torch.exp(scores - tile_max)  # [KV, N*QPK, B]
-
-                # probs @ V: [KV, N*QPK, B] @ [KV, B, D] = [KV, N*QPK, D]
-                tile_output = torch.bmm(tile_probs, v_page)
-                tile_sum = tile_probs.sum(dim=-1, keepdim=True)  # [KV, N*QPK, 1]
+                tile_probs = torch.exp(scores - tile_max)
+                # tile_output = torch.matmul(tile_probs, v_page_4d)
+                tile_output = _indirect_matmul_mock(
+                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+                )
+                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
             else:
+                # i > 0 only reachable after the i == 0 branch initialized these.
                 assert tile_max is not None
                 assert tile_sum is not None
                 assert tile_output is not None
@@ -370,13 +364,14 @@ def _create_compilable_page_attn(
                 tile_output = tile_output * rescale
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
-
-                tile_output = tile_output + torch.bmm(tile_probs, v_page)
+                # tile_output = tile_output + torch.matmul(tile_probs, v_page_4d)
+                tile_output += _indirect_matmul_mock(
+                    tile_probs, None, v_pages, page_idx, transform_b=lambda t: t.unsqueeze(1)
+                )
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
                 tile_max = new_max
 
         assert tile_output is not None and tile_sum is not None
-        # Returns [KV, N*QPK, D]; caller reshapes to [N, H, D] on CPU
         return tile_output / tile_sum
 
     return specialized_paged_attn_kernel
@@ -438,7 +433,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     # Pre-tiled additive attention mask. attention_mask_tiles[seq_idx][block_idx]
     # gives the mask tile for one KV page of one sequence.
-    # Each tile: [query_len_for_seq, block_size] on CPU.
+    # Each tile: [aligned_max_query_len, block_size] on CPU.
     attention_mask_tiles: list[list[torch.Tensor]] | None = None
 
     # Global aligned query length for stable kernel compilation.
@@ -496,86 +491,81 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         assert isinstance(model_config.dtype, torch.dtype)
         self.model_dtype: torch.dtype = model_config.dtype
 
-    def _build_attention_mask_tiles(
+    def _build_attention_mask(
         self,
         seq_lens: torch.Tensor,
         query_start_loc: torch.Tensor,
         apply_causal_mask: bool,
         max_query_len: int,
+        aligned_max_query_len: int,
         aligned_max_seq_len: int,
         device: torch.device,
-    ) -> list[list[torch.Tensor]]:
-        """Build per-sequence, per-block attention mask tiles directly as lists.
+    ) -> torch.Tensor:
+        """Build additive attention mask on Spyre.
 
-        Each sequence gets its own list of mask tiles, one per KV block.
-        Each tile has shape [query_len_for_seq, block_size] - no global padding.
+        All sequences share the same aligned_max_query_len so every mask tile
+        has a uniform query dimension — this avoids per-sequence kernel
+        specializations.
 
         Returns:
-            - attention_mask_tiles: list[num_seqs][num_blocks_per_seq] of [query_len, block_size]
+            - mask: [num_seqs, aligned_max_query_len, aligned_max_seq_len] additive mask
         """
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
         num_seqs = len(seq_lens)
-        block_size = self.block_size
 
-        attention_mask_tiles: list[list[torch.Tensor]] = []
+        q_pos = torch.arange(max_query_len, device=device)
+        kv_pos = torch.arange(aligned_max_seq_len, device=device)
 
-        for s in range(num_seqs):
-            query_len_s = int(query_lens[s].item())
-            kv_len_s = int(seq_lens[s].item())
-            num_blocks_s = (kv_len_s + block_size - 1) // block_size
+        # Padding mask: valid positions are within actual sequence/query lengths
+        q_valid = q_pos.unsqueeze(0) < query_lens.unsqueeze(1)
+        kv_valid = kv_pos.unsqueeze(0) < seq_lens.unsqueeze(1)
+        attend = q_valid.unsqueeze(2) & kv_valid.unsqueeze(1)
 
-            q_pos = torch.arange(query_len_s, device=device)
-            kv_pos = torch.arange(aligned_max_seq_len, device=device)
+        # Causal mask: prevent attending to future tokens during generation
+        if apply_causal_mask:
+            context_lens = seq_lens - query_lens
+            causal_limit = (context_lens.unsqueeze(1) + q_pos.unsqueeze(0)).unsqueeze(2)
+            kv_pos_exp = kv_pos.unsqueeze(0).unsqueeze(0)
+            causal_ok = kv_pos_exp <= causal_limit
+            attend = attend & causal_ok
 
-            # Valid attention positions for this sequence
-            q_valid = q_pos.unsqueeze(1) < query_len_s  # [query_len, 1]
-            kv_valid = kv_pos < kv_len_s  # [aligned_max_seq_len]
-            attend = q_valid & kv_valid.unsqueeze(0)  # [query_len, aligned_max_seq_len]
+        # Sliding window mask: limit attention to recent tokens
+        # For query at absolute position p, attend to [max(0, p - sliding_window + 1), p]
+        # Example: p=5, window=4 → attend to [2,3,4,5] (4 tokens)
+        # Note: computed on max_query_len; padding applied after (lines 454-462)
+        if self.sliding_window is not None:
+            context_lens = seq_lens - query_lens  # [num_seqs]
+            # Absolute query position: context_len + q_pos
+            # Window start: max(0, absolute_pos - sliding_window + 1)
+            window_start = (
+                context_lens.unsqueeze(1) + q_pos.unsqueeze(0) - self.sliding_window + 1
+            ).clamp(min=0)
+            kv_pos_exp = kv_pos.unsqueeze(0).unsqueeze(0)  # [1, 1, aligned_max_seq_len]
+            window_ok = kv_pos_exp >= window_start.unsqueeze(
+                2
+            )  # [num_seqs, max_query_len, aligned_max_seq_len]
+            attend = attend & window_ok
 
-            # Causal mask for this sequence
-            if apply_causal_mask:
-                context_len_s = kv_len_s - query_len_s
-                causal_limit = context_len_s + q_pos  # [query_len]
-                causal_ok = kv_pos.unsqueeze(0) <= causal_limit.unsqueeze(1)
-                attend = attend & causal_ok
+        # Convert to additive mask: finfo.min for masked positions, 0 for valid
+        mask_bool = ~attend  # [num_seqs, max_query_len, aligned_max_seq_len]
 
-            # Sliding window mask: limit attention to recent tokens.
-            # For query at absolute position p, attend to
-            # [max(0, p - sliding_window + 1), p].
-            if self.sliding_window is not None:
-                context_len_s = kv_len_s - query_len_s
-                window_start = (context_len_s + q_pos - self.sliding_window + 1).clamp(min=0)
-                window_ok = kv_pos.unsqueeze(0) >= window_start.unsqueeze(1)
-                attend = attend & window_ok
-
-            # Convert to additive mask: finfo.min for masked positions, 0 for valid
-            #  (mask_bool is already boolean from comparisons)
-            mask_bool = ~attend  # [query_len, aligned_max_seq_len]
-            fill = torch.finfo(self.model_dtype).min
-            mask_additive = torch.where(
-                mask_bool,
-                torch.tensor(fill, dtype=self.model_dtype, device=device),
-                torch.tensor(0.0, dtype=self.model_dtype, device=device),
+        if aligned_max_query_len > max_query_len:
+            padding = torch.ones(
+                num_seqs,
+                aligned_max_query_len - max_query_len,
+                aligned_max_seq_len,
+                dtype=torch.bool,
+                device=device,
             )
+            mask_bool = torch.cat([mask_bool, padding], dim=1)
 
-            # Tile along KV dimension
-            seq_tiles: list[torch.Tensor] = []
-            for b in range(num_blocks_s):
-                col_start = b * block_size
-                col_end = min(col_start + block_size, kv_len_s)
-                tile = mask_additive[:, col_start:col_end]
+        mask_additive = torch.where(
+            mask_bool,
+            torch.tensor(torch.finfo(self.model_dtype).min, dtype=self.model_dtype, device=device),
+            torch.tensor(0.0, dtype=self.model_dtype, device=device),
+        )
 
-                # Pad tile to block_size if needed
-                # TODO: think of reuse of mask tiles
-                if tile.shape[1] < block_size:
-                    tile = torch.nn.functional.pad(
-                        tile, (0, block_size - tile.shape[1]), mode="constant", value=fill
-                    )
-                seq_tiles.append(tile.contiguous())
-
-            attention_mask_tiles.append(seq_tiles)
-
-        return attention_mask_tiles
+        return mask_additive
 
     def build(
         self,
@@ -604,15 +594,32 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             (max_seq_len + KV_LENGTH_ALIGNMENT - 1) // KV_LENGTH_ALIGNMENT * KV_LENGTH_ALIGNMENT
         )
 
-        # Build per-sequence, per-block mask tiles directly as lists
-        attention_mask_tiles = self._build_attention_mask_tiles(
+        mask_cpu = self._build_attention_mask(
             seq_lens,
             query_start_loc,
             apply_causal_mask,
             max_query_len,
+            aligned_max_query_len,
             aligned_max_seq_len,
             torch.device("cpu"),
         )
+
+        # Pre-tile the mask: split into per-block tiles.
+        # Query dimension is uniform (aligned_max_query_len) for all sequences,
+        # so tiling only follows the KV dimension.
+        num_seqs = common_attn_metadata.num_reqs
+        block_size = self.block_size
+        attention_mask_tiles: list[list[torch.Tensor]] = []
+        for s in range(num_seqs):
+            seq_tiles: list[torch.Tensor] = []
+            kv_len_s = int(seq_lens[s].item())
+            num_blocks_s = (kv_len_s + block_size - 1) // block_size
+            for b in range(num_blocks_s):
+                col_start = b * block_size
+                col_end = col_start + block_size
+                tile = mask_cpu[s, :aligned_max_query_len, col_start:col_end]
+                seq_tiles.append(tile.contiguous())
+            attention_mask_tiles.append(seq_tiles)
 
         # Precompute slot indices on CPU to avoid CPU round-trip during forward
         sm_cpu = slot_mapping.detach().cpu()
@@ -756,7 +763,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Compiled function caches (keyed by iteration count for reshape, and
         # by (num_blocks, padded_query_len) for the per-page attention loop)
         self._reshape_fns: dict[int, object] = {}
-        self._attn_fns: dict[tuple[int, int, int], object] = {}
+        self._attn_fns: dict[tuple[int, int], object] = {}
 
         logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
 
@@ -773,16 +780,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         return self._reshape_fns[num_tokens]
 
-    def _get_attn_fn(self, num_blocks: int, num_query_tokens: int, num_queries_per_kv: int):
+    def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
-        key = (num_blocks, num_query_tokens, num_queries_per_kv)
+        key = (num_blocks, padded_query_len)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile_attn(
                 _create_compilable_page_attn(
                     num_blocks,
-                    num_query_tokens,
-                    num_queries_per_kv,
+                    padded_query_len,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
                 )
@@ -818,11 +824,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
         # Query handling depends on whether we can stay on device:
-        #   - Single-sequence decode: on-device unbind+reshape works (offset 0)
-        #   - Batch decode: needs CPU copy because unbind views at offset > 0
-        #     corrupt bmm results on Spyre
-        #   - Prefill/mixed: needs CPU copy because GQA reshape requires
-        #     transpose+contiguous which corrupts when both dims > 1
+        #   - Single-sequence decode: on-device assembly works (offset 0)
+        #   - Batch decode / prefill: needs the CPU path because the per-seq
+        #     query densification slices/transposes at offset > 0, which
+        #     corrupts on Spyre.
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
         needs_query_cpu = attn_metadata.max_query_len > 1 or attn_metadata.num_seqs > 1
@@ -839,12 +844,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             _target_device,
         )
 
-        # Step 2: Online softmax attention over pages (varlen)
-        # Pass on-device query for single-sequence decode (unbind at offset 0)
+        # Step 2: Online softmax attention over pages (varlen).
+        # Pass on-device query for single-sequence decode (assembled at offset 0
+        # without a CPU round-trip); everything else goes through query_cpu.
         query_dev = convert(query, _target_device) if not needs_query_cpu else None
         output = self._online_softmax_attention(
             query_dev,
-            query_cpu,
+            query_cpu[:num_actual_tokens] if query_cpu is not None else None,
             k_pages,
             v_pages,
             attn_metadata,
@@ -901,18 +907,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         Writes results directly into the caller's output buffer in-place.
 
-        The kernel operates entirely in [KV, N*QPK, ...] format on device to
-        avoid any transpose/permute on Spyre (which corrupts data when both
-        transposed dims are > 1). How q_for_matmul is built:
-
-        - **Single-sequence decode**: stays on device. query_dev is unbinded;
-          reshaping [H, D] -> [KV, QPK, D] at offset 0 is a safe contiguous
-          view. No CPU round-trip needed.
-
-        - **Batch decode / prefill / mixed**: requires CPU round-trip. Batch
-          decode because unbind views at offset > 0 corrupt bmm on Spyre.
-          Prefill because going from N×[H, D] to [KV, N*QPK, D] needs a
-          transpose which corrupts on Spyre when both dims > 1.
+        Query assembly builds the same padded 4D tensor
+        [num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size]
+        the kernel expects. Single-sequence decode assembles it directly on
+        device (offset 0 is a safe Spyre write, so no CPU round-trip); batch
+        decode / prefill build it on CPU and transfer.
 
         Args:
             query_dev: Query on target device (for single-seq decode), or None.
@@ -929,6 +928,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         seq_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_table
         mask_tiles_all = attn_metadata.attention_mask_tiles
+        aligned_max_query_len = attn_metadata.aligned_max_query_len
         assert mask_tiles_all is not None, (
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
@@ -946,43 +946,58 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         output_cpu = torch.zeros_like(output, device="cpu")
 
         for seq_idx in range(num_seqs):
+            # Most-naive implementation: no parallelization
+            # over sequences or GQA optimization
             q_start = int(query_start_loc[seq_idx].item())
             q_end = int(query_start_loc[seq_idx + 1].item())
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
-            num_query_tokens = query_len
 
-            if query_dev is not None and num_query_tokens == 1:
-                # Single-sequence decode: on-device, no CPU round-trip.
-                # reshape [H, D] -> [KV, QPK, D] is a contiguous view at
-                # offset 0 (single sequence guarantees first token).
-                q_for_matmul = query_dev.unbind(dim=0)[q_start].reshape(
-                    num_kv_heads, num_queries_per_kv, head_size
+            if query_dev is not None and query_len == 1:
+                # Single-sequence decode: assemble the padded 4D query on device.
+                # The one real token is written at offset 0 (a safe Spyre write);
+                # padded query rows are masked out and dropped from the result.
+                # Layout matches the CPU path: [KV, QPK, aligned_max_query_len, D].
+                q_row = query_dev.unbind(dim=0)[q_start].reshape(
+                    num_kv_heads, num_queries_per_kv, 1, head_size
                 )
+                if aligned_max_query_len > 1:
+                    q = torch.zeros(
+                        num_kv_heads,
+                        num_queries_per_kv,
+                        aligned_max_query_len,
+                        head_size,
+                        dtype=q_row.dtype,
+                        device=q_row.device,
+                    )
+                    _overwrite(q_row, q, [2], [0])
+                else:
+                    q = q_row
+                q_dev = q
             else:
                 # Batch decode / prefill: build on CPU, transfer to device.
                 assert query_cpu is not None
-                q_slice = query_cpu[q_start:q_end]  # [N, H, D]
-                q_for_matmul = (
-                    q_slice.reshape(num_query_tokens, num_kv_heads, num_queries_per_kv, head_size)
-                    .permute(1, 0, 2, 3)
-                    .contiguous()
-                    .reshape(num_kv_heads, num_query_tokens * num_queries_per_kv, head_size)
-                )
-                q_for_matmul = convert(q_for_matmul, _target_device)
+                q_seq = query_cpu[q_start:q_end]
+
+                # Pad query to global aligned_max_query_len (uniform for all seqs)
+                if aligned_max_query_len > query_len:
+                    q_seq = torch.nn.functional.pad(
+                        q_seq,
+                        (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
+                        mode="constant",
+                        value=0.0,
+                    )
+
+                # Reshape: [padded_query_len, num_heads, head_size]
+                #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
+                q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
+                q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
+                q_dev = convert(q, device=_target_device)
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
-            # Expand mask tiles for GQA on CPU: [N, B] -> [N*QPK, B]
-            # (repeat each query token's mask row for all query heads in its KV group)
-            # then transfer to device.
-            mask_tiles = [
-                convert(
-                    torch.repeat_interleave(m, num_queries_per_kv, dim=0),
-                    device=_target_device,
-                )
-                for m in mask_tiles_all[seq_idx]
-            ]
+            # mask_tiles = [m.to(_target_device) for m in mask_tiles_all[seq_idx]]
+            mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
 
             # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
             #
@@ -991,19 +1006,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # term is a per-query-row constant, and softmax is invariant under adding
             # any per-row constant to its input (numerator and denominator both pick
             # up the same exp() factor). We therefore drop it and keep only the
-            # kv-dependent term — the softmax output is bit-identical to the full form.
+            # kv-dependent term — the softmax output is bit-identical to the full
+            # form, and each tile stays 1D over KV (block_size floats per head)
+            # instead of 2D (aligned_max_query_len * block_size).
             #
             # Matches vllm/v1/attention/ops/triton_attention_helpers.py::apply_alibi_to_score
             # (alibi_offset = seq_offset - context_len) — the production Triton path.
             #
-            # The kernel scores are [KV, N*QPK, block_size]; the bias is constant
-            # across the N query tokens, so each per-block tile is built as
-            # [KV, QPK, block_size] and repeated N times along the query-token axis
-            # to match the token-major N*QPK layout of q_for_matmul.
+            # Per-tile shape: [num_kv_heads, num_queries_per_kv, 1, block_size].
             alibi_bias_tiles: list[torch.Tensor] | None = None
             if self.alibi_slopes is not None:
                 context_len = kv_len - query_len
-                slopes = self.alibi_slopes.reshape(num_kv_heads, num_queries_per_kv, 1)
                 alibi_bias_tiles = []
                 for b in range(num_blocks_needed):
                     kv_pos = torch.arange(
@@ -1011,16 +1024,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                         (b + 1) * block_size,
                         dtype=torch.float16,
                     )
-                    rel = (kv_pos - context_len).view(1, 1, block_size)
-                    bias = slopes * rel  # [KV, QPK, block_size]
-                    bias = bias.repeat(1, num_query_tokens, 1)  # [KV, N*QPK, block_size]
+                    rel = (kv_pos - context_len).view(1, 1, 1, block_size)
+                    bias = self.alibi_slopes * rel
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
-            # Run attention on target device.
-            # Kernel is specialized for (num_blocks, num_query_tokens, num_queries_per_kv).
-            attn_fn = self._get_attn_fn(num_blocks_needed, num_query_tokens, num_queries_per_kv)
+            # Run attention on target device
+            attn_fn = self._get_attn_fn(num_blocks_needed, aligned_max_query_len)
             result = attn_fn(
-                q_for_matmul,
+                q_dev,
                 k_pages,
                 v_pages,
                 page_indices,
@@ -1029,18 +1040,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 alibi_bias_tiles=alibi_bias_tiles,
             )
 
-            # Result is [KV, N*QPK, D] — convert to [N, H, D] on CPU
-            # (transpose on Spyre would corrupt; CPU reshape is safe) and write
-            # into the CPU staging buffer; one bulk H2D at the end replaces the
-            # per-token writes.
+            # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
+            #   → [query_len, num_heads, head_size]
+            # Pull result to CPU (Spyre transpose+contiguous on the head axes
+            # is broken) and write into the CPU staging buffer; one bulk H2D
+            # at the end of the loop replaces the per-token writes.
             result_cpu = convert(result, "cpu", output.dtype)
-            result_cpu = (
-                result_cpu.reshape(num_kv_heads, num_query_tokens, num_queries_per_kv, head_size)
-                .permute(1, 0, 2, 3)
-                .contiguous()
-                .reshape(num_query_tokens, num_heads, head_size)
-            )
-            output_cpu[q_start:q_end] = result_cpu[:query_len]
+            result_cpu = result_cpu.reshape(1, num_heads, aligned_max_query_len, head_size)
+            result_cpu = result_cpu.transpose(1, 2).contiguous()
+            output_cpu[q_start:q_end] = result_cpu[0, :query_len, :, :]
 
         output.copy_(convert(output_cpu, device=_target_device))
         return output
