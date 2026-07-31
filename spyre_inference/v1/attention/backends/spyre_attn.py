@@ -82,6 +82,10 @@ KV_LENGTH_ALIGNMENT = 256
 # a smaller alignment (e.g. QUERY_CHUNK_SIZE=1) for single-token decode steps.
 QUERY_CHUNK_SIZE = 32
 
+# On-device query overwrite only compiles for head_size multiples of 128; 64
+# yields an unsupported Mod(var, 32) stick coord. Otherwise fall back to CPU.
+ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
+
 
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
@@ -824,13 +828,20 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
         # Query handling depends on whether we can stay on device:
-        #   - Single-sequence decode: on-device assembly works (offset 0)
+        #   - Single-sequence decode: on-device assembly works (offset 0), but
+        #     only when the head_size keeps the overwrite layout representable
+        #     (see ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE); otherwise CPU path.
         #   - Batch decode / prefill: needs the CPU path because the per-seq
         #     query densification slices/transposes at offset > 0, which
         #     corrupts on Spyre.
         key_cpu = convert(key, "cpu")
         value_cpu = convert(value, "cpu")
-        needs_query_cpu = attn_metadata.max_query_len > 1 or attn_metadata.num_seqs > 1
+        ondevice_overwrite_ok = self.head_size % ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE == 0
+        needs_query_cpu = (
+            attn_metadata.max_query_len > 1
+            or attn_metadata.num_seqs > 1
+            or not ondevice_overwrite_ok
+        )
         query_cpu = convert(query, "cpu") if needs_query_cpu else None
 
         # Step 1: Reshape and cache — write new tokens into pages
