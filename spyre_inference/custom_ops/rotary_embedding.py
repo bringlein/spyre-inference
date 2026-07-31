@@ -40,6 +40,9 @@ from vllm.model_executor.layers.rotary_embedding.base import (
 from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
     Llama3RotaryEmbedding,
 )
+from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
+    YaRNScalingRotaryEmbedding,
+)
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -181,6 +184,13 @@ class SpyreRotaryEmbedding(_SpyreRotaryMixin, RotaryEmbedding):
 @RotaryEmbeddingBase.register_oot(name="Llama3RotaryEmbedding")
 class SpyreLlama3RotaryEmbedding(_SpyreRotaryMixin, Llama3RotaryEmbedding):
     """OOT Llama3RotaryEmbedding that applies the rotation on Spyre."""
+
+    pass
+
+
+@RotaryEmbeddingBase.register_oot(name="YaRNScalingRotaryEmbedding")
+class SpyreYaRNScalingRotaryEmbedding(_SpyreRotaryMixin, YaRNScalingRotaryEmbedding):
+    """OOT YaRNScalingRotaryEmbedding that applies the rotation on Spyre."""
 
     pass
 

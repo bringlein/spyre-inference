@@ -244,6 +244,8 @@ jobs:
           # causing torch/vllm/torch-spyre to be rebuilt on every run despite a
           # cache hit. Keep all wheels; the cache key (uv.lock hash) handles eviction.
           prune-cache: false
+          # Never save cache for ephemeral merge queue branches
+          save-cache: ${{ github.event_name != 'merge_group' }}
 
       # Layer override RPMs on top of the baseline only when the dispatch flow
       # supplied some (rpm_names). The PR flow leaves rpm_names empty -> skipped.

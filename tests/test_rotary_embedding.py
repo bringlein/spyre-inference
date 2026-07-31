@@ -27,6 +27,16 @@ LLAMA3_ROPE_PARAMS = {
     "original_max_position_embeddings": 4096,
 }
 
+YARN_ROPE_PARAMS = {
+    "rope_type": "yarn",
+    "factor": 4.0,
+    "original_max_position_embeddings": 2048,
+    "extrapolation_factor": 1,
+    "attn_factor": 1,
+    "beta_fast": 32,
+    "beta_slow": 1,
+}
+
 # head_size values spanning both Spyre RoPE regimes: the 2x2 inner dim
 # head_size//2 is stick-aligned (128->64, 256->128) or padded up to a stick (64->32).
 HEAD_SIZES = [64, 128, 256]
@@ -326,3 +336,145 @@ def test_rotary_non_neox_config_raises(default_vllm_config):
             is_neox_style=False,
             dtype=torch.float16,
         )
+
+
+@pytest.mark.rotary
+def test_yarn_rotary_oot_registration(default_vllm_config):
+    """Verify get_rope(rope_type='yarn') resolves to SpyreYaRNScalingRotaryEmbedding."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from spyre_inference.custom_ops.rotary_embedding import SpyreYaRNScalingRotaryEmbedding
+
+    rope = get_rope(
+        head_size=128,
+        max_position=8192,
+        is_neox_style=True,
+        rope_parameters=YARN_ROPE_PARAMS,
+        dtype=torch.float16,
+    )
+
+    assert isinstance(rope, SpyreYaRNScalingRotaryEmbedding), (
+        f"Expected SpyreYaRNScalingRotaryEmbedding, got {type(rope).__name__}"
+    )
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize(
+    "yarn_params",
+    [
+        YARN_ROPE_PARAMS,
+        {
+            "rope_type": "yarn",
+            "factor": 2.0,
+            "original_max_position_embeddings": 2048,
+        },
+        {
+            "rope_type": "yarn",
+            "factor": 8.0,
+            "original_max_position_embeddings": 4096,
+            "attn_factor": 2.0,
+            "beta_fast": 64,
+            "beta_slow": 2,
+        },
+    ],
+    ids=["factor4_defaults", "factor2_defaults", "factor8_custom_params"],
+)
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+def test_yarn_rotation_math_matches_reference_cpu(default_vllm_config, yarn_params, head_size):
+    """CPU-only: gather_rotation + _rotate_neox_2x2 match forward_native for YaRN,
+    validating that the scaled cos/sin cache produced by YaRN is correctly transformed
+    into the 2x2 rotation matrix format across different scaling factors and parameters."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
+        YaRNScalingRotaryEmbedding,
+    )
+    from spyre_inference.custom_ops.rotary_embedding import _rotate_neox_2x2
+
+    torch.manual_seed(77)
+    max_position = int(yarn_params["original_max_position_embeddings"] * yarn_params["factor"])
+    num_tokens, num_heads = 32, 4
+    rope = get_rope(
+        head_size,
+        max_position,
+        is_neox_style=True,
+        rope_parameters=yarn_params,
+        dtype=torch.float16,
+    )
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long)
+    query = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
+    key = torch.randn(num_tokens, num_heads * head_size, dtype=torch.float16)
+
+    rot = rope.gather_rotation(positions, torch.device("cpu"))
+    assert rot is not None and rot.device.type == "cpu"
+    actual_query = _rotate_neox_2x2(query, rot, head_size)
+    actual_key = _rotate_neox_2x2(key, rot, head_size)
+
+    expected_query, expected_key = YaRNScalingRotaryEmbedding.forward_native(
+        rope, positions, query, key
+    )
+    torch.testing.assert_close(actual_query.float(), expected_query.float(), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(actual_key.float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+@pytest.mark.parametrize("flatten", [True, False])
+def test_yarn_rotary_forward_oot_on_spyre(default_vllm_config, head_size, flatten):
+    """YaRN rotation runs on Spyre and matches forward_native across head_size
+    and 2D/3D layouts, confirming the 2x2 cache inherits YaRN frequency scaling
+    (interpolation + extrapolation blending + mscale) via the MRO."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+    from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
+        YaRNScalingRotaryEmbedding,
+    )
+
+    torch.manual_seed(42)
+    max_position, num_tokens, num_heads = 8192, 32, 4
+    rope = get_rope(
+        head_size=head_size,
+        max_position=max_position,
+        is_neox_style=True,
+        rope_parameters=YARN_ROPE_PARAMS,
+        dtype=torch.float16,
+    )
+
+    positions = torch.randint(0, max_position, (num_tokens,), dtype=torch.long).to("spyre")
+    query, key = _make_qk(num_tokens, num_heads, num_heads, head_size, flatten)
+
+    _prime_rope(rope, positions)
+    actual_query, actual_key = rope.forward_oot(positions, query.to("spyre"), key.to("spyre"))
+    expected_query, expected_key = YaRNScalingRotaryEmbedding.forward_native(
+        rope, positions.cpu(), query.cpu(), key.cpu()
+    )
+
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.rotary
+@pytest.mark.parametrize("head_size", HEAD_SIZES)
+def test_yarn_cos_sin_cache_has_mscale(default_vllm_config, head_size):
+    """YaRN's cos_sin_cache incorporates the mscale factor, producing magnitudes
+    distinct from base RoPE. This ensures the scaling is not silently lost."""
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+
+    max_position = 8192
+    rope_yarn = get_rope(
+        head_size,
+        max_position,
+        is_neox_style=True,
+        rope_parameters=YARN_ROPE_PARAMS,
+        dtype=torch.float16,
+    )
+    rope_base = get_rope(
+        head_size,
+        max_position,
+        is_neox_style=True,
+        dtype=torch.float16,
+    )
+
+    assert not torch.allclose(
+        rope_yarn.cos_sin_cache[:2048], rope_base.cos_sin_cache[:2048], atol=1e-4
+    ), "YaRN cos_sin_cache should differ from base RoPE due to mscale and freq blending"
