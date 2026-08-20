@@ -34,6 +34,7 @@ Run on the Spyre pod:
 """
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -46,13 +47,32 @@ from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 
+from spyre_inference.custom_ops.utils import convert
+
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
+    slot_major_kv_layout,
     _TILE_CONFIG_DIR,
     _attn_tile_config_filename,
 )
+
+
+def _to_cache_device(cache_cpu, device):
+    """Move a KV cache to device, pinning the slot-major layout on Spyre exactly
+    as the model runner allocates it (#551). Without it the index_copy_ scatter
+    in reshape_and_cache silently writes the wrong rows (torch-spyre#3705)."""
+    if device.type != "spyre":
+        return cache_cpu.to(device)
+    num_blocks, block_size, num_kv_heads, head_size = cache_cpu.shape
+    return cache_cpu.to(
+        device,
+        device_layout=slot_major_kv_layout(
+            num_blocks * block_size, num_kv_heads, head_size, cache_cpu.dtype
+        ),
+    )
+
 
 def _divisors(n: int) -> list[int]:
     return [d for d in range(1, n + 1) if n % d == 0]
@@ -158,8 +178,8 @@ def _build_inputs(
     attn_metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
 
     cache_device = torch.device(device)
-    k_pages = k_pages_cpu.to(cache_device)
-    v_pages = v_pages_cpu.to(cache_device)
+    k_pages = _to_cache_device(k_pages_cpu, cache_device)
+    v_pages = _to_cache_device(v_pages_cpu, cache_device)
 
     ref = _ref_attn(
         query, k_pages_cpu, v_pages_cpu, query_len, kv_len, block_table, block_size, scale
@@ -207,11 +227,14 @@ def _run_once(inputs, tile_kv_heads, head_size, num_query_heads, num_kv_heads):
     )
     output = torch.empty_like(inputs["query"]).to(inputs["cache_device"])
     kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
+    device = inputs["cache_device"]
+    # Post-#551 reshape_and_cache scatters via on-device index_copy_, so q/k/v
+    # must be on the pages' device (asserted in _reshape_and_cache).
     impl.forward(
         layer=None,
-        query=inputs["query"],
-        key=inputs["key"],
-        value=inputs["value"],
+        query=convert(inputs["query"], device),
+        key=convert(inputs["key"], device),
+        value=convert(inputs["value"], device),
         kv_cache=kv_cache,
         attn_metadata=inputs["attn_metadata"],
         output=output,
@@ -263,6 +286,32 @@ def _device_times_us(prof) -> tuple[float, float]:
     return total, mem
 
 
+@contextlib.contextmanager
+def _spyre_vllm_config():
+    """Establish a Spyre vLLM config context for standalone (non-pytest) use.
+
+    Mirrors the default_vllm_config pytest fixture in
+    tests/plugin/spyre_testing_plugin/pytest_plugin.py so that
+    get_current_vllm_config() (called from SpyreAttentionMetadataBuilder /
+    _build_inputs) resolves outside of pytest.
+    """
+    from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
+    from vllm.config.compilation import CompilationConfig
+    from vllm.forward_context import set_forward_context
+    from vllm.platforms import PlatformEnum, current_platform
+    from spyre_inference.custom_ops import register_all
+
+    current_platform._enum = PlatformEnum.OOT
+    register_all()
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+        model_config=ModelConfig(dtype=torch.float16),
+    )
+    with set_current_vllm_config(config), set_forward_context(None, config):
+        yield
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--head-size", type=int, default=128)
@@ -302,6 +351,12 @@ def main():
         "backend is inactive; not recommended)",
     )
     args = ap.parse_args()
+
+    # Establish the vLLM config context for the whole run. Entered manually (not
+    # a `with` block) to avoid re-indenting the body; the script ends with
+    # os._exit(0), which bypasses context cleanup anyway.
+    _cfg_ctx = _spyre_vllm_config()
+    _cfg_ctx.__enter__()
 
     candidates = (
         [int(x) for x in args.candidates.split(",") if x]
