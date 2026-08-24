@@ -15,30 +15,33 @@
 """Estimate the working-set size of one iteration of the online-softmax inner
 loop in SpyreAttentionImpl (_create_compilable_page_attn).
 
-The per-iteration working set is the sum of bytes of the live tensors the
-compiler must keep resident to evaluate the score/prob/accumulate chain. The
-coarse-tile hint maps tiles across corelets, so the residency budget is the
-per-corelet scratchpad and the working set of interest is that of ONE tile.
-When a tile exceeds the per-corelet budget the compiler spills to HBM, adding
-IO. Tiling the KV-head dim (tile_kv_heads = N) splits num_kv_heads into N tiles
-(one per corelet, up to num_corelets), shrinking every tensor whose leading dim
-is num_kv_heads by 1/N. The scratchpad size and corelet count are supplied by
-the caller (Spyre: 2 MiB/corelet, 64 corelets).
+Two corrections over the first version, both prompted by the lq=128 device sweep
+that FALSIFIED the original spill prediction (.plans/06-does-tiling-help-working-set.md):
 
-This is a pure arithmetic model (no device, no torch). For each requested
-tiling it reports two per-corelet numbers:
-  - peak: all tensors live at once during one iteration (the scratchpad-fit
-    check),
-  - carry_over: only the online-softmax accumulators (tile_output, tile_max,
-    tile_sum) that must survive to the next iteration, i.e. what we want to
-    keep resident in scratchpad between iterations.
-It also reports how many corelets the tiling occupies.
+1. LIVENESS PEAK, not sum. The old model summed all ~12 transients as if
+   simultaneously live. The allocator reuses storage once a buffer is dead, so
+   the true residency figure is the maximum SIMULTANEOUSLY-live bytes across the
+   iteration's dataflow. live_peak_bytes walks the i>0 branch for that.
+
+2. PER-CORE, not whole-op, and NOT "2 MiB * 32". The always-on work_division
+   pass splits each op's iteration space across up to NUM_CORES cores, so the
+   2 MiB scratchpad applies PER CORE to a per-core SLICE. The split per dim is
+   the largest DIVISOR of that dim's size <= cores-remaining (core_split), and
+   the product over output dims is <= NUM_CORES. So a dim of size 8 yields at
+   most 8 cores; the budget does not pool. Per-core bytes = live_peak /
+   (core split on each tensor's dims).
+
+CAVEATS (pure-arithmetic UPPER BOUND, no device/torch): ignores in-place reuse,
+sub-buffer aliasing, allocator packing; treat crossovers as order-of-magnitude.
+Coarse tiling is RESIDENCY, not parallelism (work_division maps cores
+independently of any tiling hint) -- so there is no "corelets used" output.
+NUM_CORES=32 per work_division's cost model; the old "64 corelets" is unverified.
 
 Usage:
     python scripts/attn_working_set.py \\
         --head-size 128 --num-query-heads 32 --num-kv-heads 8 \\
         --block-size 128 --padded-query-len 32 \\
-        --tile-kv-heads 1,2,4,8 --scratchpad-kib 2048 --num-corelets 64
+        --tile-kv-heads 1,2,4,8 --scratchpad-kib 2048 --num-cores 32
 """
 
 import argparse
@@ -58,81 +61,158 @@ def _fmt(nbytes: float) -> str:
 def _shapes(hkv, qpk, pql, block_size, head_size):
     return {
         "S": (hkv, qpk, pql, block_size),  # scores / tile_probs
-        "R": (hkv, qpk, pql, 1),  # per-row reductions (max/sum/rescale)
+        "R": (hkv, qpk, pql, 1),  # per-row reductions
         "O": (hkv, qpk, pql, head_size),  # tile_output
-        "KV": (hkv, 1, block_size, head_size),  # k_page_4d / v_page_4d (post-permute)
+        "KV": (hkv, 1, block_size, head_size),  # k_page_4d / v_page_4d
         "Q": (hkv, qpk, pql, head_size),  # q tile
         "M": (pql, block_size),  # mask_tile
         "A": (hkv, qpk, 1, block_size),  # alibi_bias_tile
     }
 
 
-def carried_tensors(
-    hkv: int, qpk: int, pql: int, block_size: int, head_size: int
-) -> dict[str, tuple[int, ...]]:
-    """State that must survive to the NEXT iteration (the online-softmax carry).
-
-    Only the running accumulators persist across the loop: tile_output, tile_max,
-    tile_sum. Everything else (q tile, k/v page, scores, probs, mask, new_max,
-    rescale) is transient and freed at the iteration boundary. This is the set
-    we want to keep resident in scratchpad between iterations.
-    """
+def carried_tensors(hkv, qpk, pql, block_size, head_size):
+    """Accumulators that survive to the next iteration: tile_output/max/sum."""
     s = _shapes(hkv, qpk, pql, block_size, head_size)
     return {"tile_output": s["O"], "tile_max": s["R"], "tile_sum": s["R"]}
 
 
-def peak_tensors(
-    hkv: int,
-    qpk: int,
-    pql: int,
-    block_size: int,
-    head_size: int,
-    has_alibi: bool,
-) -> dict[str, tuple[int, ...]]:
-    """Tensors live simultaneously at the peak of one iteration (i > 0 branch).
-
-    Carried state (tile_output/tile_max/tile_sum) plus the transients needed to
-    produce the next accumulator values. tile_max is shown once (the rebind
-    `tile_max = new_max` frees the old buffer); new_max/rescale are the extra
-    live reductions at the peak. Shapes mirror _create_compilable_page_attn.
-    """
+def peak_tensors(hkv, qpk, pql, block_size, head_size, has_alibi):
+    """Every distinct buffer touched in the i>0 branch (for the BREAKDOWN only,
+    NOT a simultaneously-live set -- use live_peak_bytes for residency)."""
     s = _shapes(hkv, qpk, pql, block_size, head_size)
-    t: dict[str, tuple[int, ...]] = {
-        # carried in
-        "tile_output": s["O"],
-        "tile_max": s["R"],
-        "tile_sum": s["R"],
-        # transient
-        "q": s["Q"],
-        "k_page_4d": s["KV"],
-        "v_page_4d": s["KV"],
-        "mask_tile": s["M"],
-        "scores": s["S"],
-        "scores_max": s["R"],
-        "tile_probs": s["S"],
-        "new_max": s["R"],
-        "rescale": s["R"],
+    t = {
+        "tile_output": s["O"], "tile_max": s["R"], "tile_sum": s["R"],
+        "q": s["Q"], "k_page_4d": s["KV"], "v_page_4d": s["KV"],
+        "mask_tile": s["M"], "scores": s["S"], "scores_max": s["R"],
+        "tile_probs": s["S"], "new_max": s["R"], "rescale": s["R"],
     }
     if has_alibi:
         t["alibi_bias_tile"] = s["A"]
     return t
 
 
-def working_set_bytes(tensors: dict[str, tuple[int, ...]]) -> int:
+def working_set_bytes(tensors):
     return sum(math.prod(shape) * _DTYPE_BYTES for shape in tensors.values())
 
 
-def report(
-    head_size: int,
-    num_query_heads: int,
-    num_kv_heads: int,
-    block_size: int,
-    padded_query_len: int,
-    tile_counts: list[int],
-    has_alibi: bool,
-    scratchpad_bytes: int | None,
-    num_corelets: int,
-) -> None:
+def _sz(shape):
+    return math.prod(shape) * _DTYPE_BYTES
+
+
+def core_split(size: int, max_cores: int) -> int:
+    """Largest divisor of size that is <= max_cores (work_division.py:173-186).
+    NOT min(size, max_cores): must divide evenly (size=8,cores=32 -> 8)."""
+    for i in range(max_cores, 0, -1):
+        if size % i == 0:
+            return i
+    return 1
+
+
+def op_core_splits(output_dim_sizes, max_cores):
+    """Greedy per-dim core split over output dims; product <= max_cores
+    (multi_dim_iteration_space_split output-dim pass, work_division.py:258-277)."""
+    splits = {name: 1 for name, _ in output_dim_sizes}
+    remaining = max_cores
+    for name, size in output_dim_sizes:
+        if remaining <= 1:
+            break
+        s = core_split(size, remaining)
+        if s > 1:
+            splits[name] = s
+            remaining //= s
+    return splits
+
+
+_TENSOR_AXES = {
+    "tile_output": ("kv_head", "qpk", "lq", "d"),
+    "tile_max": ("kv_head", "qpk", "lq"),
+    "tile_sum": ("kv_head", "qpk", "lq"),
+    "q": ("kv_head", "qpk", "lq", "d"),
+    "k_page_4d": ("kv_head", "blk", "d"),
+    "v_page_4d": ("kv_head", "blk", "d"),
+    "mask_tile": ("lq", "blk"),
+    "scores": ("kv_head", "qpk", "lq", "blk"),
+    "scores_max": ("kv_head", "qpk", "lq"),
+    "new_max": ("kv_head", "qpk", "lq"),
+    "rescale": ("kv_head", "qpk", "lq"),
+    "tile_probs": ("kv_head", "qpk", "lq", "blk"),
+    "weighted": ("kv_head", "qpk", "lq", "d"),
+    "alibi_bias_tile": ("kv_head", "qpk", "blk"),
+}
+
+
+def _per_core_divisor(buf, splits):
+    d = 1
+    for ax in _TENSOR_AXES.get(buf, ()):
+        d *= splits.get(ax, 1)
+    return d
+
+
+def _iteration_splits(hkv, qpk, pql, head_size, num_cores):
+    """Core split over the output dims the carries live under (kv_head,qpk,lq),
+    priority kv_head > qpk > lq. blk is omitted (PV-matmul reduction dim)."""
+    return op_core_splits([("kv_head", hkv), ("qpk", qpk), ("lq", pql)], num_cores)
+
+
+def live_peak_bytes(hkv, qpk, pql, block_size, head_size, has_alibi, num_cores=1):
+    """Max simultaneously-live bytes across the i>0 dataflow (spyre_attn.py:505-519).
+    num_cores>1 divides each buffer by the work_division core split on its dims,
+    returning the PER-CORE peak. Returns (peak_bytes, step_label)."""
+    s = _shapes(hkv, qpk, pql, block_size, head_size)
+    O, R, S, KV, Q, M, A = s["O"], s["R"], s["S"], s["KV"], s["Q"], s["M"], s["A"]
+    splits = _iteration_splits(hkv, qpk, pql, head_size, num_cores)
+    raw = {
+        "tile_output": _sz(O), "tile_max": _sz(R), "tile_sum": _sz(R),
+        "q": _sz(Q), "k_page_4d": _sz(KV), "v_page_4d": _sz(KV),
+        "mask_tile": _sz(M), "scores": _sz(S), "scores_max": _sz(R),
+        "new_max": _sz(R), "rescale": _sz(R), "tile_probs": _sz(S),
+        "weighted": _sz(O),
+    }
+    if has_alibi:
+        raw["alibi_bias_tile"] = _sz(A)
+    size = {b: max(1, raw[b] // _per_core_divisor(b, splits)) for b in raw}
+
+    alibi_reads = ["alibi_bias_tile"] if has_alibi else []
+    steps = [
+        ("scores=q@kT+mask", ["scores"], ["q", "k_page_4d", "mask_tile", *alibi_reads]),
+        ("scores_max=amax", ["scores_max"], []),
+        ("new_max=max", ["new_max"], ["scores_max"]),
+        ("rescale=exp", ["rescale"], []),
+        ("tile_output*=rescale", [], []),
+        ("tile_sum*=rescale", [], ["rescale"]),
+        ("tile_probs=exp", ["tile_probs"], ["scores"]),
+        ("weighted=probs@v", ["weighted"], ["v_page_4d"]),
+        ("tile_output+=weighted", [], ["weighted"]),
+        ("tile_sum+=sum(probs)", [], ["tile_probs"]),
+        ("tile_max=new_max", [], ["new_max", "tile_max"]),
+    ]
+    live = {"tile_output", "tile_max", "tile_sum", "q", "k_page_4d",
+            "v_page_4d", "mask_tile"}
+    if has_alibi:
+        live.add("alibi_bias_tile")
+    peak = sum(size[b] for b in live)
+    peak_label = "iter start (inputs+carries)"
+    for label, born, dead in steps:
+        for b in born:
+            live.add(b)
+        cur = sum(size[b] for b in live)
+        if cur > peak:
+            peak, peak_label = cur, label
+        for b in dead:
+            live.discard(b)
+    return peak, peak_label
+
+
+def carry_bytes(hkv, qpk, pql, block_size, head_size, num_cores=1):
+    """Per-core loop-carried accumulator bytes (tile_output/max/sum)."""
+    s = _shapes(hkv, qpk, pql, block_size, head_size)
+    splits = _iteration_splits(hkv, qpk, pql, head_size, num_cores)
+    raw = {"tile_output": _sz(s["O"]), "tile_max": _sz(s["R"]), "tile_sum": _sz(s["R"])}
+    return sum(max(1, raw[b] // _per_core_divisor(b, splits)) for b in raw)
+
+
+def report(head_size, num_query_heads, num_kv_heads, block_size, padded_query_len,
+           tile_counts, has_alibi, scratchpad_bytes, num_cores):
     qpk = num_query_heads // num_kv_heads
     print(
         f"shape: head_size={head_size} num_query_heads={num_query_heads} "
@@ -141,37 +221,37 @@ def report(
     )
     if scratchpad_bytes is not None:
         print(
-            f"scratchpad budget: {_fmt(scratchpad_bytes)} per corelet "
-            f"({num_corelets} corelets)"
+            f"scratchpad budget: {_fmt(scratchpad_bytes)} PER CORE "
+            f"(work_division across up to {num_cores} cores; does NOT pool)"
         )
     print()
-
     for n in tile_counts:
         if num_kv_heads % n != 0:
             print(f"tile_kv_heads={n}: SKIP (does not divide num_kv_heads={num_kv_heads})")
             continue
         hkv = num_kv_heads // n
-        # Working set of ONE tile = what one corelet must hold.
-        peak = working_set_bytes(
-            peak_tensors(hkv, qpk, padded_query_len, block_size, head_size, has_alibi)
+        splits = _iteration_splits(hkv, qpk, padded_query_len, head_size, num_cores)
+        cores_used = math.prod(splits.values())
+        whole, _ = live_peak_bytes(
+            hkv, qpk, padded_query_len, block_size, head_size, has_alibi, 1
         )
-        carry = working_set_bytes(
-            carried_tensors(hkv, qpk, padded_query_len, block_size, head_size)
+        per_core, label = live_peak_bytes(
+            hkv, qpk, padded_query_len, block_size, head_size, has_alibi, num_cores
         )
+        carry_pc = carry_bytes(hkv, qpk, padded_query_len, block_size, head_size, num_cores)
+        split_str = "x".join(f"{k}:{v}" for k, v in splits.items() if v > 1) or "none"
         line = (
-            f"tile_kv_heads={n}: hkv_per_tile={hkv}  "
-            f"peak={_fmt(peak)}  carry_over={_fmt(carry)}"
+            f"tile_kv_heads={n}: hkv_per_tile={hkv}  cores_used={cores_used} "
+            f"({split_str})  whole_op_peak={_fmt(whole)}  "
+            f"per_core_peak={_fmt(per_core)} @ {label}  per_core_carry={_fmt(carry_pc)}"
         )
         if scratchpad_bytes is not None:
-            fits = "FITS" if peak <= scratchpad_bytes else "SPILLS"
-            line += (
-                f"  (peak {peak / scratchpad_bytes * 100:.1f}%, "
-                f"carry {carry / scratchpad_bytes * 100:.1f}% of budget, {fits})"
-            )
-        line += f"  corelets_used={min(n, num_corelets)}/{num_corelets}"
+            fits = "FITS" if per_core <= scratchpad_bytes else "SPILLS"
+            line += f"  (per_core {per_core / scratchpad_bytes * 100:.1f}% of 2MiB, {fits})"
         print(line)
 
-    print("\nper-tensor breakdown (tile_kv_heads=1, peak / i>0 branch):")
+    print("\nper-tensor breakdown (tile_kv_heads=1, all buffers in i>0 branch):")
+    print("(distinct buffers, whole-op bytes; NOT simultaneously live)")
     base = peak_tensors(num_kv_heads, qpk, padded_query_len, block_size, head_size, has_alibi)
     carried_names = set(carried_tensors(num_kv_heads, qpk, padded_query_len, block_size, head_size))
     for name, shape in sorted(base.items(), key=lambda kv: -math.prod(kv[1])):
@@ -180,46 +260,28 @@ def report(
         print(f"  {name:16s} {str(shape):28s} {_fmt(b):>10s}  [{tag}]")
 
 
-def main() -> None:
+def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--head-size", type=int, default=128)
     ap.add_argument("--num-query-heads", type=int, default=32)
     ap.add_argument("--num-kv-heads", type=int, default=8)
     ap.add_argument("--block-size", type=int, default=128)
     ap.add_argument("--padded-query-len", type=int, default=32)
-    ap.add_argument(
-        "--tile-kv-heads",
-        type=str,
-        default="1,2,4,8",
-        help="comma-separated tile_kv_heads values to compare",
-    )
+    ap.add_argument("--tile-kv-heads", type=str, default="1,2,4,8",
+                    help="comma-separated tile_kv_heads values to compare")
     ap.add_argument("--alibi", action="store_true", help="include ALiBi bias tile")
-    ap.add_argument(
-        "--scratchpad-kib",
-        type=int,
-        required=True,
-        help="per-corelet scratchpad budget in KiB (e.g. Spyre: 2048)",
-    )
-    ap.add_argument(
-        "--num-corelets",
-        type=int,
-        required=True,
-        help="number of corelets tiles can map across (e.g. Spyre: 64)",
-    )
+    ap.add_argument("--scratchpad-kib", type=int, required=True,
+                    help="per-core scratchpad budget in KiB (Spyre: 2048)")
+    ap.add_argument("--num-cores", type=int, default=32,
+                    help="cores work_division splits an op across (Spyre: 32)")
     args = ap.parse_args()
-
     tile_counts = [int(x) for x in args.tile_kv_heads.split(",") if x]
     scratchpad_bytes = args.scratchpad_kib * 1024 if args.scratchpad_kib else None
     report(
-        head_size=args.head_size,
-        num_query_heads=args.num_query_heads,
-        num_kv_heads=args.num_kv_heads,
-        block_size=args.block_size,
-        padded_query_len=args.padded_query_len,
-        tile_counts=tile_counts,
-        has_alibi=args.alibi,
-        scratchpad_bytes=scratchpad_bytes,
-        num_corelets=args.num_corelets,
+        head_size=args.head_size, num_query_heads=args.num_query_heads,
+        num_kv_heads=args.num_kv_heads, block_size=args.block_size,
+        padded_query_len=args.padded_query_len, tile_counts=tile_counts,
+        has_alibi=args.alibi, scratchpad_bytes=scratchpad_bytes, num_cores=args.num_cores,
     )
 
 
