@@ -185,10 +185,17 @@ def _build_inputs(
         query, k_pages_cpu, v_pages_cpu, query_len, kv_len, block_table, block_size, scale
     )
 
+    # Measure 1: convert q/k/v to the pages' device ONCE here, so the profiled
+    # forward() does not include the per-call H2D transfer (which otherwise
+    # dominates and hides the on-device attention compute the tiling affects).
+    query_dev = convert(query, cache_device)
+    key_dev = convert(key, cache_device)
+    value_dev = convert(value, cache_device)
+
     return {
-        "query": query,
-        "key": key,
-        "value": value,
+        "query": query_dev,
+        "key": key_dev,
+        "value": value_dev,
         "k_pages": k_pages,
         "v_pages": v_pages,
         "attn_metadata": attn_metadata,
@@ -227,19 +234,89 @@ def _run_once(inputs, tile_kv_heads, head_size, num_query_heads, num_kv_heads):
     )
     output = torch.empty_like(inputs["query"]).to(inputs["cache_device"])
     kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
-    device = inputs["cache_device"]
-    # Post-#551 reshape_and_cache scatters via on-device index_copy_, so q/k/v
-    # must be on the pages' device (asserted in _reshape_and_cache).
+    # q/k/v are already on the pages' device (converted once in _build_inputs);
+    # the metadata device mirrors (page_index_tables, slot_mapping_device) are
+    # populated by the first forward() and reused, so warmup calls take them out
+    # of the profiled window.
     impl.forward(
         layer=None,
-        query=convert(inputs["query"], device),
-        key=convert(inputs["key"], device),
-        value=convert(inputs["value"], device),
+        query=inputs["query"],
+        key=inputs["key"],
+        value=inputs["value"],
         kv_cache=kv_cache,
         attn_metadata=inputs["attn_metadata"],
         output=output,
     )
     return output
+
+
+@torch.inference_mode()
+def _verify_loopspec(
+    inputs, tile_kv_heads, tile_q_heads, head_size, num_query_heads, num_kv_heads
+) -> bool:
+    """Confirm the coarse-tile hint actually emitted a tiled loop.
+
+    Runs the real forward() under torch._inductor.utils.run_and_get_code with the
+    attention kernel forced to compile, and checks the generated inductor source
+    for `LoopSpec(... count=sympify('N'))` for each tiled head dim. This is the
+    reliable structural signal that the hint took effect, independent of the
+    (IO-dominated) timing — see torch-spyre
+    tests/inductor/test_coarse_tile_e2e.py::test_hint_flash_attention_loopspec.
+
+    A dropped hint (e.g. tile bound to no loop var) emits no such LoopSpec.
+
+    _maybe_compile reads spyre_attn._FORCE_COMPILE_ATTN, which is captured at
+    import time, so setting the env var at runtime is a no-op. Patch the module
+    attribute directly instead (and restore it).
+    """
+    from torch._inductor.utils import run_and_get_code
+    from spyre_inference.v1.attention.backends import spyre_attn as _sa
+
+    prev = _sa._FORCE_COMPILE_ATTN
+    _sa._FORCE_COMPILE_ATTN = True
+    try:
+        impl = SpyreAttentionImpl(
+            num_heads=num_query_heads,
+            head_size=head_size,
+            scale=inputs["scale"],
+            num_kv_heads=num_kv_heads,
+            tile_kv_heads=tile_kv_heads,
+            tile_q_heads=tile_q_heads,
+        )
+        output = torch.empty_like(inputs["query"]).to(inputs["cache_device"])
+        kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
+        _, source_codes = run_and_get_code(
+            impl.forward,
+            None,
+            inputs["query"],
+            inputs["key"],
+            inputs["value"],
+            kv_cache,
+            inputs["attn_metadata"],
+            output,
+        )
+    finally:
+        _sa._FORCE_COMPILE_ATTN = prev
+
+    src = "\n".join(source_codes)
+    checks = []
+    if tile_kv_heads > 1:
+        checks.append(("kv_head", tile_kv_heads))
+    if tile_q_heads > 1:
+        checks.append(("qpk", tile_q_heads))
+    all_found = "LoopSpec(" in src and len(checks) > 0
+    parts = []
+    for name, count in checks:
+        needle = f"count=sympify('{count}')"
+        hit = needle in src
+        all_found &= hit
+        parts.append(f"{name}÷{count}={'ok' if hit else 'MISS'}")
+    print(
+        f"[verify] kv={tile_kv_heads} q={tile_q_heads}: "
+        f"{'FOUND' if all_found else 'MISSING'} [{', '.join(parts)}] "
+        f"({len(source_codes)} source module(s))"
+    )
+    return all_found
 
 
 def _assert_device_profiler_active(prof) -> None:
@@ -350,6 +427,20 @@ def main():
         help="skip the AIUPTI device-profiler startup check (ranks on noise if the "
         "backend is inactive; not recommended)",
     )
+    ap.add_argument(
+        "--verify-loopspec",
+        action="store_true",
+        help="verify each tile>1 candidate emits a LoopSpec(count=sympify('N')) in "
+        "the generated source (structural check the hint took effect), then exit "
+        "without profiling/ranking",
+    )
+    ap.add_argument(
+        "--verify-tile-q-heads",
+        type=int,
+        default=1,
+        help="tile_q_heads (num_queries_per_kv split) to include in the "
+        "--verify-loopspec check; default 1 (kv_head only)",
+    )
     args = ap.parse_args()
 
     # Establish the vLLM config context for the whole run. Entered manually (not
@@ -374,6 +465,26 @@ def main():
         device=args.device,
     )
     ref = inputs["ref"]
+
+    # Verify-only mode: structural check that the hint emits a tiled loop, then
+    # exit. A candidate is checked if either head-dim tile is > 1.
+    if args.verify_loopspec:
+        all_ok = True
+        tile_q = args.verify_tile_q_heads
+        for tile_kv_heads in candidates:
+            if args.num_kv_heads % tile_kv_heads != 0:
+                continue
+            if tile_kv_heads <= 1 and tile_q <= 1:
+                continue
+            all_ok &= _verify_loopspec(
+                inputs,
+                tile_kv_heads,
+                tile_q,
+                args.head_size,
+                args.num_query_heads,
+                args.num_kv_heads,
+            )
+        os._exit(0 if all_ok else 1)
 
     # Startup guard: confirm the AIUPTI device profiler is active before ranking.
     # Probe with tile_kv_heads=1 (the no-op baseline) after a warmup so compile
