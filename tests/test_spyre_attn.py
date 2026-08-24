@@ -28,6 +28,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
+    _clamp_tile_count,
     slot_major_kv_layout,
 )
 from spyre_testing_plugin.pytest_plugin import spyre_available
@@ -603,8 +604,19 @@ def test_spyre_attn_force_compile_attn_multi_seq(
     [
         pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
         pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        # Tiled prefill at one and at >2 pages. A tile count equal to
+        # num_kv_heads divides the head dim to extent 1, which the read-copy
+        # advance mis-projects for the hoisted K/V page (kv head 0 correct,
+        # 1..N-1 wrong); the error is largest at a single page, where no other
+        # page dilutes it in the softmax denominator.
+        pytest.param([(32, 128)], id="prefill_nb1(q=32,kv=128)"),
+        pytest.param([(32, 384)], id="prefill_nb3(q=32,kv=384)"),
+        pytest.param([(32, 768)], id="prefill_nb6(q=32,kv=768)"),
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+        pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
     ],
 )
+@pytest.mark.parametrize("force_compile_attn", [True], indirect=True)
 @pytest.mark.parametrize(
     "tile_kv_heads",
     [
@@ -618,10 +630,16 @@ def test_spyre_attn_tiling(
     default_vllm_config,
     seq_lens: list[tuple[int, int]],
     tile_kv_heads: int,
+    force_compile_attn: bool,
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """Hkv coarse-tiling must not change results (num_kv_heads=8 divisible by all)."""
+    """Hkv coarse-tiling must not change results (num_kv_heads=8 divisible by all).
+
+    force_compile_attn is required: the coarse-tile hints are consumed by the
+    Inductor passes, so on the eager path spyre_hint is a no-op and the tiling
+    would go untested.
+    """
     _run_spyre_attn_test(
         seq_lens=seq_lens,
         block_size=128,
@@ -804,6 +822,56 @@ def test_spyre_attn_alibi(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         use_alibi=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("NONE", id="compilation_NONE")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(32, 128)], id="prefill_nb1(q=32,kv=128)"),
+        pytest.param([(32, 384)], id="prefill_nb3(q=32,kv=384)"),
+    ],
+)
+@pytest.mark.parametrize("force_compile_attn", [True], indirect=True)
+@pytest.mark.parametrize(
+    "tile_kv_heads",
+    [
+        pytest.param(4, id="tile_kv_heads(4)"),
+        pytest.param(8, id="tile_kv_heads(8)"),
+    ],
+)
+def test_spyre_attn_alibi_tiling(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    tile_kv_heads: int,
+    force_compile_attn: bool,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """ALiBi under Hkv coarse-tiling.
+
+    The bias tiles are [kv_head, qpk, 1, blk] -- the same size-1-axis shape class
+    whose tiled read-copy advance is mis-projected when a dim is divided to
+    extent 1, so they need their own tiled coverage.
+    """
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        use_alibi=True,
+        tile_kv_heads=tile_kv_heads,
     )
 
 
@@ -1396,3 +1464,28 @@ def test_reshape_and_cache_scatter(
         import gc
 
         gc.collect()
+
+
+@pytest.mark.parametrize(
+    "count,dim_size,expected",
+    [
+        # Untouched: extent stays >= 2.
+        (1, 8, 1),
+        (2, 8, 2),
+        (4, 8, 4),
+        (2, 4, 2),
+        # count == dim_size would divide the dim to extent 1, which the tiled
+        # read-copy advance mis-projects for the hoisted K/V page.
+        (8, 8, 4),
+        (4, 4, 2),
+        (2, 2, 1),
+        # Halving repeatedly until the extent fits.
+        (8, 4, 2),
+        (8, 2, 1),
+    ],
+)
+def test_clamp_tile_count(count, dim_size, expected):
+    assert _clamp_tile_count(count, dim_size) == expected
+    clamped = _clamp_tile_count(count, dim_size)
+    if clamped > 1:
+        assert dim_size // clamped >= 2

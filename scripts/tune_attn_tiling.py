@@ -269,11 +269,21 @@ def _verify_loopspec(
     import time, so setting the env var at runtime is a no-op. Patch the module
     attribute directly instead (and restore it).
     """
+    import torch._dynamo
+    import torch._inductor.config
     from torch._inductor.utils import run_and_get_code
     from spyre_inference.v1.attention.backends import spyre_attn as _sa
 
     prev = _sa._FORCE_COMPILE_ATTN
     _sa._FORCE_COMPILE_ATTN = True
+    # Both compile caches must be defeated or a later candidate silently reuses an
+    # earlier one's artifact and reports THAT candidate's tile count: the tile
+    # count reaches the compiler through the spyre_hint side-channel, not through
+    # the FX graph, so it does not participate in the FX-graph cache key.
+    # Symptom without this: kv=4 and kv=8 both emit count=2 after a kv=2 run.
+    prev_disable = torch._inductor.config.force_disable_caches
+    torch._inductor.config.force_disable_caches = True
+    torch._dynamo.reset()
     try:
         impl = SpyreAttentionImpl(
             num_heads=num_query_heads,
@@ -297,6 +307,7 @@ def _verify_loopspec(
         )
     finally:
         _sa._FORCE_COMPILE_ATTN = prev
+        torch._inductor.config.force_disable_caches = prev_disable
 
     src = "\n".join(source_codes)
     checks = []
@@ -474,6 +485,8 @@ def main():
         for tile_kv_heads in candidates:
             if args.num_kv_heads % tile_kv_heads != 0:
                 continue
+            if tile_kv_heads > 1 and args.num_kv_heads // tile_kv_heads < 2:
+                continue
             if tile_kv_heads <= 1 and tile_q <= 1:
                 continue
             all_ok &= _verify_loopspec(
@@ -484,6 +497,9 @@ def main():
                 args.num_query_heads,
                 args.num_kv_heads,
             )
+        # os._exit skips the interpreter's atexit flush, so the [verify] lines
+        # are lost unless stdout is drained first.
+        sys.stdout.flush()
         os._exit(0 if all_ok else 1)
 
     # Startup guard: confirm the AIUPTI device profiler is active before ranking.
@@ -502,9 +518,16 @@ def main():
         if args.num_kv_heads % tile_kv_heads != 0:
             print(f"skip tile_kv_heads={tile_kv_heads} (does not divide num_kv_heads)")
             continue
+        # The backend clamps counts that leave a per-tile extent < 2 (see
+        # _clamp_tile_count), so timing them would record a count that never runs.
+        if tile_kv_heads > 1 and args.num_kv_heads // tile_kv_heads < 2:
+            print(f"skip tile_kv_heads={tile_kv_heads} (per-tile extent < 2)")
+            continue
 
         # Correctness gate.
-        out = _run_once(inputs, tile_kv_heads, args.head_size, args.num_query_heads, args.num_kv_heads)
+        out = _run_once(
+            inputs, tile_kv_heads, args.head_size, args.num_query_heads, args.num_kv_heads
+        )
         max_diff = (out.to("cpu") - ref).abs().max().item()
         correct = torch.allclose(out.to("cpu"), ref, atol=args.atol, rtol=args.rtol)
         if not correct:
@@ -516,7 +539,9 @@ def main():
         # profiler accumulates events across all calls in the block, so the
         # summed device time is divided by the iteration count).
         for _ in range(args.warmup):
-            _run_once(inputs, tile_kv_heads, args.head_size, args.num_query_heads, args.num_kv_heads)
+            _run_once(
+                inputs, tile_kv_heads, args.head_size, args.num_query_heads, args.num_kv_heads
+            )
         with profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
             record_shapes=True,
@@ -603,6 +628,7 @@ def main():
         )
     print(f"Wrote {run_path}")
 
+    sys.stdout.flush()
     os._exit(0)  # avoid TimestampCalibrator abort at teardown (see profile example)
 
 
