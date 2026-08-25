@@ -83,14 +83,14 @@ QUERY_CHUNK_SIZE = 32
 INT32_ELEMS_PER_STICK = 32
 
 # Directory of tuned coarse-tile configs, one JSON per attention shape signature
-# (see _attn_tile_config_filename). Emitted by scripts/tune_attn_tiling.py.
+# (see _attn_tile_config_filename). Emitted by examples/tune_attn_tiling.py.
 _TILE_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
 
-# `lq` (padded query length) tiling is enabled only at long prefill; below this
-# threshold tiling is measured HARMFUL (Plan 8: +9% at lq=32). The tuned config's
-# `tile_lq` is therefore applied only when padded_query_len >= this value. `qpk`
-# tiling has no such gate (it is a small, workload-fixed axis).
-LQ_TILE_THRESHOLD = 256
+# kv_head tiling is enabled only at long prefill; below this padded_query_len it
+# is measured HARMFUL (Plan 8: +9% at lq=32, +20.8% decode). The tuned config's
+# `tile_kv_heads` is therefore applied only when padded_query_len >= this value.
+# `tile_q_heads` (qpk) has no such gate (it is a small, workload-fixed axis).
+KV_HEAD_TILE_THRESHOLD = 256
 
 
 def _attn_tile_config_filename(
@@ -112,16 +112,14 @@ def _get_attn_tile_config(
     num_queries_per_kv: int,
     block_size: int,
 ) -> dict:
-    """Load the tuned query-axis coarse-tile config for this shape, or a no-op
-    fallback.
+    """Load the tuned coarse-tile config for this shape, or a no-op fallback.
 
-    Fallback is {"tile_qpk": 1, "tile_lq": 1} (no tiling), so an absent or invalid
-    config leaves the kernel byte-identical to the untuned path. `tile_qpk` must
-    divide num_queries_per_kv evenly (the compiler asserts even divisibility);
-    `tile_lq` divides the padded query length, validated at kernel-build time.
-    A value that does not divide its axis is dropped back to 1 with a warning.
+    Fallback is {"tile_kv_heads": 1, "tile_q_heads": 1} (no tiling), so an absent
+    or invalid config leaves the kernel byte-identical to the untuned path. Each
+    tile count must divide its axis evenly (the compiler asserts even
+    divisibility); a value that does not is dropped back to 1 with a warning.
     """
-    default = {"tile_qpk": 1, "tile_lq": 1}
+    default = {"tile_kv_heads": 1, "tile_q_heads": 1}
     fname = _attn_tile_config_filename(
         head_size, num_kv_heads, num_queries_per_kv, block_size
     )
@@ -132,21 +130,19 @@ def _get_attn_tile_config(
     with open(path) as f:
         cfg = json.load(f)
 
-    def _validated_qpk(val: int) -> int:
-        if val < 1 or num_queries_per_kv % val != 0:
+    def _validated(key: str, axis: int) -> int:
+        val = int(cfg.get(key, 1))
+        if val < 1 or axis % val != 0:
             logger.warning(
-                f"Ignoring tile_qpk={val} from {path}: must be >=1 and divide "
-                f"num_queries_per_kv={num_queries_per_kv} evenly; disabling that axis"
+                f"Ignoring {key}={val} from {path}: must be >=1 and divide "
+                f"{axis} evenly; disabling that axis"
             )
             return 1
         return val
 
-    # `lq` divides the padded query length, which is not known here (it varies per
-    # step). Divisibility is enforced later, per padded_query_len, in the kernel
-    # build (_clamp_tile_count + the compiler's even-divisibility assert).
     return {
-        "tile_qpk": _validated_qpk(int(cfg.get("tile_qpk", 1))),
-        "tile_lq": max(1, int(cfg.get("tile_lq", 1))),
+        "tile_kv_heads": _validated("tile_kv_heads", num_kv_heads),
+        "tile_q_heads": _validated("tile_q_heads", num_queries_per_kv),
     }
 
 
@@ -221,13 +217,14 @@ def _clamp_tile_count(count: int, dim_size: int) -> int:
 
 
 class _TileHints:
-    """Coarse-tile the online-softmax ops along the QUERY axes (qpk, lq).
+    """Coarse-tile the online-softmax ops along the head dims (kv_head, qpk).
 
-    Query-axis only, by design (Plan 10): qpk and lq are dims the K/V pages do
-    not have, so a `num_tiles_per_dim` hint on them slices q/scores/probs/
-    tile_output but cannot force a cross-stick read-copy on the pages. kv_head
-    tiling is deliberately NOT supported here (it is a page axis and hoists both
-    pages to HBM).
+    kv_head is a NATIVE page axis (k_page[kv_head, blk, d]); tiling it slices a
+    real page dim, so with both pages hoisted to full-extent HBM buffers the
+    read-copy is a clean slice. This is why kv_head compiles where the query-only
+    axes (qpk-broadcast, lq) do not: the score matmul broadcasts the page over
+    those, and the broadcast-expand fused into the gather makes the tiled page
+    read-copy an unresolvable slot-major->head-major relayout.
 
     Binding a hint requires the tiled dim to be a named loop var on the ops in
     scope, so the tiled dims are named on the kernel inputs (declare_tensor_dim +
@@ -243,17 +240,17 @@ class _TileHints:
 
     def __init__(
         self,
-        tile_qpk: int,
-        tile_lq: int,
+        tile_kv_heads: int,
+        tile_q_heads: int,
+        num_kv_heads: int,
         num_queries_per_kv: int,
-        padded_query_len: int,
     ):
         self.active = False
         self._spyre_hint = None
         self._tiles: list[tuple[str, int]] = []
-        tile_qpk = _clamp_tile_count(tile_qpk, num_queries_per_kv)
-        tile_lq = _clamp_tile_count(tile_lq, padded_query_len)
-        want = (tile_qpk > 1) or (tile_lq > 1)
+        tile_kv_heads = _clamp_tile_count(tile_kv_heads, num_kv_heads)
+        tile_q_heads = _clamp_tile_count(tile_q_heads, num_queries_per_kv)
+        want = (tile_kv_heads > 1) or (tile_q_heads > 1)
         if not want:
             return
         try:
@@ -261,20 +258,20 @@ class _TileHints:
         except ImportError:
             return
         self._spyre_hint = spyre_hint
-        if tile_qpk > 1:
-            self._tiles.append(("qpk", tile_qpk))
-        if tile_lq > 1:
-            self._tiles.append(("lq", tile_lq))
+        if tile_kv_heads > 1:
+            self._tiles.append(("kv_head", tile_kv_heads))
+        if tile_q_heads > 1:
+            self._tiles.append(("qpk", tile_q_heads))
         self.active = True
 
     @contextlib.contextmanager
     def tile(self):
-        """Open nested coarse-tile loops (one per tiled query dim) around the
+        """Open nested coarse-tile loops (one per tiled head dim) around the
         whole page loop. One dim per spyre_hint() call; scopes nest.
 
         Explicit nested `with` rather than ExitStack: Dynamo traces the
         spyre_hint annotate context managers only as lexical `with` statements.
-        At most two query dims are tiled (qpk, lq).
+        At most two head dims are tiled (kv_head, qpk).
         """
         if not self.active:
             yield
@@ -293,7 +290,7 @@ class _TileHints:
 
     @contextlib.contextmanager
     def named(self, *names: str):
-        """Name the enclosed op's output dims so the query-dim hints can bind."""
+        """Name the enclosed op's output dims so the head-dim hints can bind."""
         if not self.active:
             yield
             return
@@ -312,7 +309,7 @@ def _name_attn_inputs(
     block_size,
     head_size,
 ):
-    """Name the traced kernel inputs so query-dim tile hints can bind (PR #3674).
+    """Name the traced kernel inputs so head-dim tile hints can bind (PR #3674).
 
     A `num_tiles_per_dim` hint only tiles a dim that propagation can trace back to
     a named loop var on the inputs; naming only intermediate outputs is not enough
@@ -362,30 +359,33 @@ def _create_compilable_page_attn(
     head_size: int,
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
-    tile_qpk: int = 1,
-    tile_lq: int = 1,
+    tile_kv_heads: int = 1,
+    tile_q_heads: int = 1,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
     Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi,
-    logits_soft_cap, tile_qpk, and tile_lq are closure constants.
+    logits_soft_cap, tile_kv_heads, and tile_q_heads are closure constants.
 
-    tile_qpk / tile_lq > 1 wrap the whole unrolled page loop in nested coarse-tile
-    hints over the QUERY axes (queries-per-kv `qpk`, padded query length `lq`),
-    shrinking the score/prob/output transients so the fused chain stays resident
-    and avoids spill/refill IO. Both == 1 emits no hints (byte-identical to the
-    untuned kernel). Supplied by the tuned config (see _get_attn_tile_config).
+    tile_kv_heads / tile_q_heads > 1 wrap the whole unrolled page loop in nested
+    coarse-tile hints over the head axes (KV heads `kv_head`, queries-per-kv
+    `qpk`), shrinking the score/prob/output transients so the fused chain stays
+    resident and avoids spill/refill IO. Both == 1 emits no hints (byte-identical
+    to the untuned kernel). Supplied by the tuned config (see _get_attn_tile_config).
 
-    The query axes do not exist on the K/V pages, so the hints cannot force a
-    cross-stick read-copy on the pages (Plan 10). This lets V stay loop-internal:
-    when tiling is active, K is pre-gathered/hoisted (its restickify is a matmul
-    fact, independent of tiling) but V is gathered INSIDE the tile scope so it can
-    be lx-resident. Only matmul outputs are named (a matmul inherits no dim names
-    from its inputs, PR #3674); naming q/k_pages/v_pages plus the two matmul
-    outputs is sufficient for the query-dim hints to bind. The final normalization
-    stays INSIDE the tile scope (finalize_layouts cannot restickify a per-tile-
-    written accumulator into an untiled read); the output reshape stays OUTSIDE
-    (it is untiled).
+    When tiling is active the page gather + head-major permute is HOISTED out of
+    the tile scope for BOTH K and V. Inside the scope, coarse-tile read-copy
+    insertion would have to fuse the permute into a copy of the slot-major cache
+    (see slot_major_kv_layout) and no candidate layout can express that transpose
+    — the beam search fails with "no mechanism to resolve stick incompatibility".
+    Hoisting makes each page a plain full-extent buffer the copy can slice along
+    the tiled kv_head dim. It costs one HBM round-trip per page; the score/prob
+    transients still stay on-chip. Only matmul outputs are named (a matmul inherits
+    no dim names from its inputs, PR #3674); naming q/k_pages/v_pages plus the two
+    matmul outputs is sufficient for the head-dim hints to bind. The final
+    normalization stays INSIDE the tile scope (finalize_layouts cannot restickify a
+    per-tile-written accumulator into an untiled read); the caller does the output
+    reshape (folding it into the kernel corrupts the tiled accumulator's layout).
     """
 
     def specialized_paged_attn_kernel(
@@ -414,52 +414,43 @@ def _create_compilable_page_attn(
                 the derivation at the bias-tile construction site in
                 _online_softmax_attention.
 
-        Returns [padded_query_len, num_heads, head_size].
+        Returns [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
+        (the caller folds the head dims and moves the query axis out).
         """
         tile_max = None
         tile_sum = None
         tile_output = None
 
-        th = _TileHints(tile_qpk, tile_lq, q.shape[1], q.shape[2])
+        th = _TileHints(tile_kv_heads, tile_q_heads, q.shape[0], q.shape[1])
 
-        def gather_k(i):
+        def gather_page(i):
             # index_select, not `k_pages[page_idx]`: subscripting lowers to
             # aten.index, which upcasts the int32 index to int64 and fails eager.
             page_idx = page_index_table[i, 0:1]
             k_page = k_pages.index_select(0, page_idx)
-            # Token-major page to head-major for the matmuls; permutes on device.
-            return k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-
-        def gather_v(i):
-            page_idx = page_index_table[i, 0:1]
             v_page = v_pages.index_select(0, page_idx)
-            return v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+            # Token-major page to head-major for the matmuls; permutes on device.
+            return (
+                k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1),
+                v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1),
+            )
 
-        # Query-axis tiling asymmetry (Plan 10): K's restickify is a matmul-input
-        # fact (score matmul reduces over `d`, generates `blk`, but the slot-major
-        # cache is stick-on-`d`), so K round-trips HBM regardless — hoist it out of
-        # the tile scope as a plain full-extent buffer. V is Input2 of `probs@v`
-        # (generated=`d` == cache layout, no restickify) and the query axes are not
-        # V dims, so V is NOT sliced and can stay loop-internal / lx-resident:
-        # gather it INSIDE the loop. Only applied when tiling is active (it
-        # reassociates the untiled kernel's fusion groups otherwise).
-        k_pages_hoisted = [gather_k(i) for i in range(num_blocks)] if th.active else None
+        # When tiling, the page gather + head-major permute is hoisted OUT of the
+        # tile scope for BOTH pages (see the factory docstring for why). It also
+        # reassociates the untiled kernel's fusion groups, so it is applied only
+        # when tiling is on.
+        pages = [gather_page(i) for i in range(num_blocks)] if th.active else None
 
         # One tile scope wraps the ENTIRE unrolled page loop (PR #3674): a fresh
         # scope per iteration makes the scheduler interleave blocks and
         # validate_coarse_tile_groups rejects the non-contiguous group.
         with th.tile():
             for i in range(num_blocks):
-                if k_pages_hoisted is not None:
-                    k_page_4d = k_pages_hoisted[i]
-                    v_page_4d = gather_v(i)
-                else:
-                    k_page_4d = gather_k(i)
-                    v_page_4d = gather_v(i)
+                k_page_4d, v_page_4d = pages[i] if pages is not None else gather_page(i)
 
                 mask_tile = mask_tiles[i]
 
-                # Matmul output carries no names -> name it so the query-dim hints
+                # Matmul output carries no names -> name it so the head-dim hints
                 # bind. Downstream elementwise/reductions inherit these names.
                 with th.named("kv_head", "qpk", "lq", "blk"):
                     scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
@@ -506,9 +497,10 @@ def _create_compilable_page_attn(
             assert tile_output is not None and tile_sum is not None
             attn = tile_output / tile_sum
 
-        # The output reshape is untiled and stays OUTSIDE the tile scope.
-        attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
-        return attn.reshape(padded_query_len, num_heads, head_size)
+        # Return the raw 4D accumulator; the caller reshapes with .contiguous()
+        # (folding the transpose into the compiled kernel corrupts the tiled
+        # accumulator's device layout -> wrong output metadata / half-size storage).
+        return attn
 
     return specialized_paged_attn_kernel
 
@@ -1087,8 +1079,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         logits_soft_cap: float | None = None,
         attn_type: str = AttentionType.DECODER,
         kv_sharing_target_layer_name: str | None = None,
-        tile_qpk: int | None = None,
-        tile_lq: int | None = None,
+        tile_kv_heads: int | None = None,
+        tile_q_heads: int | None = None,
     ) -> None:
         self.num_heads = num_heads
         self.head_size = head_size
@@ -1098,22 +1090,27 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
 
-        # Query-axis coarse-tile counts for the online-softmax kernel. None ->
+        # Head-axis coarse-tile counts for the online-softmax kernel. None ->
         # resolved lazily per (block_size, padded_query_len) from the tuned config
         # (_get_attn_tile_config); an explicit value overrides the config (tests/
-        # tuner). tile_qpk must divide num_queries_per_kv; tile_lq divides the
-        # padded query length (checked per length in the kernel build).
-        if tile_qpk is not None and (
-            tile_qpk < 1 or self.num_queries_per_kv % tile_qpk != 0
+        # tuner). tile_kv_heads must divide num_kv_heads; tile_q_heads must divide
+        # num_queries_per_kv.
+        if tile_kv_heads is not None and (
+            tile_kv_heads < 1 or self.num_kv_heads % tile_kv_heads != 0
         ):
             raise ValueError(
-                f"tile_qpk={tile_qpk} must be >=1 and divide "
+                f"tile_kv_heads={tile_kv_heads} must be >=1 and divide "
+                f"num_kv_heads={self.num_kv_heads}"
+            )
+        if tile_q_heads is not None and (
+            tile_q_heads < 1 or self.num_queries_per_kv % tile_q_heads != 0
+        ):
+            raise ValueError(
+                f"tile_q_heads={tile_q_heads} must be >=1 and divide "
                 f"num_queries_per_kv={self.num_queries_per_kv}"
             )
-        if tile_lq is not None and tile_lq < 1:
-            raise ValueError(f"tile_lq={tile_lq} must be >=1")
-        self._tile_qpk_override = tile_qpk
-        self._tile_lq_override = tile_lq
+        self._tile_kv_heads_override = tile_kv_heads
+        self._tile_q_heads_override = tile_q_heads
 
         # `== STOCK`, not `!= NONE`: a bare CompilationConfig (e.g. the unit-test
         # fixture) leaves mode unset (Python None), which `!= NONE` would wrongly
@@ -1147,7 +1144,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
         # Compiled attention loops, keyed by
-        # (num_blocks, padded_query_len, tile_qpk, tile_lq).
+        # (num_blocks, padded_query_len, tile_kv_heads, tile_q_heads).
         self._attn_fns: dict[tuple[int, int, int, int], object] = {}
 
         logger.debug_once(
@@ -1155,39 +1152,42 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
     def _resolve_tile_counts(self, block_size: int, padded_query_len: int) -> tuple[int, int]:
-        """(tile_qpk, tile_lq): explicit overrides, else tuned config.
+        """(tile_kv_heads, tile_q_heads): explicit overrides, else tuned config.
 
-        `tile_lq` is gated on padded_query_len >= LQ_TILE_THRESHOLD: tiling the
-        query length is only profitable at long prefill and measured harmful at
-        decode/short prefill (Plan 8), so short lengths keep tile_lq == 1.
+        `tile_kv_heads` is gated on padded_query_len >= KV_HEAD_TILE_THRESHOLD:
+        kv_head tiling only helps at long prefill and is measured harmful at
+        decode/short prefill (Plan 8), so short lengths keep tile_kv_heads == 1.
         """
-        if self._tile_qpk_override is not None and self._tile_lq_override is not None:
-            qpk, lq = self._tile_qpk_override, self._tile_lq_override
+        if (
+            self._tile_kv_heads_override is not None
+            and self._tile_q_heads_override is not None
+        ):
+            kv_heads, q_heads = self._tile_kv_heads_override, self._tile_q_heads_override
         else:
             cfg = _get_attn_tile_config(
                 self.head_size, self.num_kv_heads, self.num_queries_per_kv, block_size
             )
-            qpk = (
-                self._tile_qpk_override
-                if self._tile_qpk_override is not None
-                else cfg["tile_qpk"]
+            kv_heads = (
+                self._tile_kv_heads_override
+                if self._tile_kv_heads_override is not None
+                else cfg["tile_kv_heads"]
             )
-            lq = (
-                self._tile_lq_override
-                if self._tile_lq_override is not None
-                else cfg["tile_lq"]
+            q_heads = (
+                self._tile_q_heads_override
+                if self._tile_q_heads_override is not None
+                else cfg["tile_q_heads"]
             )
-        if padded_query_len < LQ_TILE_THRESHOLD:
-            lq = 1
-        return qpk, lq
+        if padded_query_len < KV_HEAD_TILE_THRESHOLD:
+            kv_heads = 1
+        return kv_heads, q_heads
 
     def _get_attn_fn(self, num_blocks: int, padded_query_len: int, block_size: int):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
         # Tile counts vary with block_size (config is shape-keyed) and
-        # padded_query_len (the lq threshold), so they are part of the key.
-        tile_qpk, tile_lq = self._resolve_tile_counts(block_size, padded_query_len)
-        key = (num_blocks, padded_query_len, tile_qpk, tile_lq)
+        # padded_query_len (the kv_head threshold), so they are part of the key.
+        tile_kv_heads, tile_q_heads = self._resolve_tile_counts(block_size, padded_query_len)
+        key = (num_blocks, padded_query_len, tile_kv_heads, tile_q_heads)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
                 _create_compilable_page_attn(
@@ -1197,8 +1197,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     self.head_size,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
-                    tile_qpk=tile_qpk,
-                    tile_lq=tile_lq,
+                    tile_kv_heads=tile_kv_heads,
+                    tile_q_heads=tile_q_heads,
                 ),
                 self._compile_attn,
             )
@@ -1424,9 +1424,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
             # Run attention on target device
-            tile_qpk, tile_lq = self._resolve_tile_counts(block_size, aligned_max_query_len)
-            if tile_qpk > 1 or tile_lq > 1:
-                # Name the kernel inputs so the query-dim tile hints can bind
+            tile_kv_heads, tile_q_heads = self._resolve_tile_counts(
+                block_size, aligned_max_query_len
+            )
+            if tile_kv_heads > 1 or tile_q_heads > 1:
+                # Name the kernel inputs so the head-dim tile hints can bind
                 # (PR #3674: naming only intermediates is insufficient).
                 _name_attn_inputs(
                     q_dev,
@@ -1451,6 +1453,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
 
             assert result.dtype == output.dtype
-            output[q_start:q_end] = result[:query_len]
+            # Kernel returns [num_kv_heads, num_queries_per_kv, padded_query_len,
+            # head_size]; fold the head dims and move the query axis out to match
+            # output's [num_tokens, num_heads, head_size]. .contiguous() is
+            # load-bearing under coarse tiling (the accumulator's device layout
+            # carries a tiled kv_head dim).
+            result = result.reshape(1, self.num_heads, aligned_max_query_len, head_size)
+            result = result.transpose(1, 2).contiguous()
+            output[q_start:q_end] = result[0, :query_len, :, :]
 
         return output

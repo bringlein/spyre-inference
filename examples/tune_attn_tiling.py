@@ -12,24 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tune the QUERY-axis coarse-tile counts (tile_qpk, tile_lq) for the Spyre
-online-softmax attention kernel, using torch profiling as the measurement.
+"""Tune the HEAD-axis coarse-tile counts (tile_kv_heads, tile_q_heads) for the
+Spyre online-softmax attention kernel, using torch profiling as the measurement.
 
-For one attention shape it sweeps tile_lq over a candidate list (and optionally a
-fixed tile_qpk), runs the kernel under torch.profiler, and ranks candidates by
-TOTAL self device (SPYRE / PrivateUse1) time — memory ops (Memcpy / Memset /
-restickify) INCLUDED, because keeping the gathered V page resident is precisely
-about avoiding on-device round-trips, so the ranking must count them. The
-memory-op share is reported separately as a diagnostic: a tiling that spills the
-page shows a larger share. Every candidate is correctness-gated against a CPU
-reference before it can win. The winning {"tile_qpk": Q, "tile_lq": L} is written
-to the shape-keyed JSON consumed by SpyreAttentionImpl (see
-spyre_attn._get_attn_tile_config), and a timestamped per-run JSON with all
-candidates + printed tables is saved for inspection.
+For one attention shape it sweeps tile_kv_heads over a candidate list (and
+optionally a fixed tile_q_heads), runs the kernel under torch.profiler, and ranks
+candidates by TOTAL self device (SPYRE / PrivateUse1) time — memory ops (Memcpy /
+Memset / restickify) INCLUDED, because head-axis tiling shrinks the on-device
+transients precisely to avoid spill/refill round-trips, so the ranking must count
+them. The memory-op share is reported separately as a diagnostic. Every candidate
+is correctness-gated against a CPU reference before it can win. The winning
+{"tile_kv_heads": K, "tile_q_heads": Q} is written to the shape-keyed JSON consumed
+by SpyreAttentionImpl (see spyre_attn._get_attn_tile_config), and a timestamped
+per-run JSON with all candidates + printed tables is saved for inspection.
 
-tile_lq only takes effect at padded_query_len >= LQ_TILE_THRESHOLD (the backend
-gates it), so sweep with --query-len >= 256 and --context-loop-iterations set so
-historical_len = kv_len - query_len >= 0.
+tile_kv_heads only takes effect at padded_query_len >= KV_HEAD_TILE_THRESHOLD (the
+backend gates it), so sweep with --query-len >= 256 and --context-loop-iterations
+set so historical_len = kv_len - query_len >= 0.
 
 Run on the Spyre pod:
     cd /home/ngl/helion-experiments/spyre-inference \\
@@ -41,7 +40,9 @@ Run on the Spyre pod:
 import argparse
 import contextlib
 import json
+import logging
 import os
+import re
 import sys
 from datetime import datetime
 
@@ -228,7 +229,7 @@ def _ref_attn(query, key_cache, value_cache, query_len, kv_len, block_table, blo
     return torch.einsum("hqk,khd->qhd", attn, v)
 
 
-def _make_impl(inputs, tile_lq, tile_qpk, head_size, num_query_heads, num_kv_heads):
+def _make_impl(inputs, tile_kv_heads, tile_q_heads, head_size, num_query_heads, num_kv_heads):
     """Build one SpyreAttentionImpl for a candidate. Reused across warmup and
     profiled iterations so the per-length compiled kernel is cached after the
     first call and its compile cost does not enter the ranked device-time metric.
@@ -238,8 +239,8 @@ def _make_impl(inputs, tile_lq, tile_qpk, head_size, num_query_heads, num_kv_hea
         head_size=head_size,
         scale=inputs["scale"],
         num_kv_heads=num_kv_heads,
-        tile_qpk=tile_qpk,
-        tile_lq=tile_lq,
+        tile_kv_heads=tile_kv_heads,
+        tile_q_heads=tile_q_heads,
     )
 
 
@@ -265,14 +266,14 @@ def _run_once(impl, inputs):
 
 @torch.inference_mode()
 def _verify_loopspec(
-    inputs, tile_lq, tile_qpk, head_size, num_query_heads, num_kv_heads
+    inputs, tile_kv_heads, tile_q_heads, head_size, num_query_heads, num_kv_heads
 ) -> bool:
     """Confirm the coarse-tile hint actually emitted a tiled loop.
 
     Runs the real forward() under torch._inductor.utils.run_and_get_code with the
     attention kernel forced to compile (impl._compile_attn = True), and checks the
     generated inductor source for `LoopSpec(... count=sympify('N'))` for each
-    tiled query dim. This is the reliable structural signal that the hint took
+    tiled head dim. This is the reliable structural signal that the hint took
     effect, independent of the (IO-dominated) timing — see torch-spyre
     tests/inductor/test_coarse_tile_e2e.py::test_hint_flash_attention_loopspec.
 
@@ -295,8 +296,8 @@ def _verify_loopspec(
             head_size=head_size,
             scale=inputs["scale"],
             num_kv_heads=num_kv_heads,
-            tile_qpk=tile_qpk,
-            tile_lq=tile_lq,
+            tile_kv_heads=tile_kv_heads,
+            tile_q_heads=tile_q_heads,
         )
         # Force the attention kernel to compile regardless of the vLLM config mode
         # (STOCK_TORCH_COMPILE), so run_and_get_code captures inductor source.
@@ -318,10 +319,10 @@ def _verify_loopspec(
 
     src = "\n".join(source_codes)
     checks = []
-    if tile_qpk > 1:
-        checks.append(("qpk", tile_qpk))
-    if tile_lq > 1:
-        checks.append(("lq", tile_lq))
+    if tile_kv_heads > 1:
+        checks.append(("kv_head", tile_kv_heads))
+    if tile_q_heads > 1:
+        checks.append(("qpk", tile_q_heads))
     all_found = "LoopSpec(" in src and len(checks) > 0
     parts = []
     for name, count in checks:
@@ -330,11 +331,137 @@ def _verify_loopspec(
         all_found &= hit
         parts.append(f"{name}÷{count}={'ok' if hit else 'MISS'}")
     print(
-        f"[verify] qpk={tile_qpk} lq={tile_lq}: "
+        f"[verify] kv_head={tile_kv_heads} qpk={tile_q_heads}: "
         f"{'FOUND' if all_found else 'MISSING'} [{', '.join(parts)}] "
         f"({len(source_codes)} source module(s))"
     )
     return all_found
+
+
+class _LxPinningCapture(logging.Handler):
+    """Capture the allocator's per-buffer LX-vs-HBM residency decisions.
+
+    torch-spyre's scratchpad allocator logs one line per op at DEBUG:
+        lx_pinning: <buf> (<op_kind>) -> <reason>
+    `reason == "lx"` means the buffer stays resident in the LX scratchpad; any
+    other string is the first check it failed, i.e. it lives in HBM (round-trips
+    DRAM). We attach this handler around the compile so we don't depend on env
+    vars / stderr scraping, and classify each record.
+    """
+
+    _RE = re.compile(r"lx_pinning:\s*(\S+)\s*\(([^)]*)\)\s*(?:->|→)\s*(.+)")
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records: list[tuple[str, str, str]] = []
+
+    def emit(self, record):
+        m = self._RE.search(record.getMessage())
+        if m:
+            self.records.append((m.group(1), m.group(2).strip(), m.group(3).strip()))
+
+
+@torch.inference_mode()
+def _verify_residency(
+    inputs, tile_kv_heads, tile_q_heads, head_size, num_query_heads, num_kv_heads
+) -> bool:
+    """Report which attention buffers are LX-resident vs written back to HBM.
+
+    Compiles the tiled kernel (like _verify_loopspec) while capturing the
+    allocator's `lx_pinning:` decisions. Prints a residency summary and, as a
+    diagnostic, flags the K/V page reads (expected in HBM under the both-pages
+    hoist) and the softmax transients (expected LX-resident — the actual win).
+
+    Returns True if at least some softmax transient stayed LX (the tiling
+    delivered on-chip residency); False if everything spilled to HBM (the tile
+    bought nothing), so the caller can treat it as a red flag. The K/V page HBM
+    round-trip is EXPECTED (the hoist trades it for keeping the transients
+    on-chip), so it is reported but does not fail the check.
+    """
+    import torch._dynamo
+    import torch._inductor.config
+    from torch._inductor.utils import run_and_get_code
+
+    # Ensure torch-spyre's logging is initialized and the allocator logger is at
+    # DEBUG BEFORE the compile, otherwise its lazy re-config on first use resets
+    # the level/handlers and the very first candidate emits nothing (the records
+    # exist under SPYRE_INDUCTOR_LOG but the in-process handler misses them).
+    try:
+        from torch_spyre import logging_config as _spyre_log_cfg
+
+        _spyre_log_cfg.initialize()
+        _spyre_log_cfg.configure_python_logging()
+        _spyre_log_cfg.set_log_level("spyre.inductor.scratchpad.allocator", "DEBUG")
+    except Exception:
+        pass
+
+    alloc_logger = logging.getLogger("spyre.inductor.scratchpad.allocator")
+    prev_level = alloc_logger.level
+    alloc_logger.setLevel(logging.DEBUG)
+    capture = _LxPinningCapture()
+    alloc_logger.addHandler(capture)
+
+    prev_disable = torch._inductor.config.force_disable_caches
+    torch._inductor.config.force_disable_caches = True
+    torch._dynamo.reset()
+    try:
+        impl = SpyreAttentionImpl(
+            num_heads=num_query_heads,
+            head_size=head_size,
+            scale=inputs["scale"],
+            num_kv_heads=num_kv_heads,
+            tile_kv_heads=tile_kv_heads,
+            tile_q_heads=tile_q_heads,
+        )
+        impl._compile_attn = True
+        output = torch.empty_like(inputs["query"]).to(inputs["cache_device"])
+        kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
+        run_and_get_code(
+            impl.forward,
+            None,
+            inputs["query"],
+            inputs["key"],
+            inputs["value"],
+            kv_cache,
+            inputs["attn_metadata"],
+            output,
+        )
+    finally:
+        torch._inductor.config.force_disable_caches = prev_disable
+        alloc_logger.removeHandler(capture)
+        alloc_logger.setLevel(prev_level)
+
+    # The reshape_and_cache kernels compile first and also emit lx_pinning lines;
+    # the attention kernel is the one carrying coarse_tile_* buffers. Restrict the
+    # report to records from a compile group that contains a coarse_tile buffer.
+    lx = [r for r in capture.records if r[2] == "lx"]
+    hbm = [r for r in capture.records if r[2] != "lx"]
+    # Page reads: the hoisted K/V gather slices feeding the matmuls appear as
+    # coarse_tile_read_copy_* of arg0/arg4 (the page args) or clones of the
+    # gathered page buffers.
+    page_hbm = [r for r in hbm if "read_copy" in r[0] and ("arg" in r[0] or "buf" in r[0])]
+    transient_lx = [r for r in lx if r[1] in ("mul", "add", "sum", "div", "sub", "exp", "maximum", "amax")]
+
+    print(
+        f"\n[residency] kv_head={tile_kv_heads} qpk={tile_q_heads}: "
+        f"{len(lx)} buffer(s) LX-resident, {len(hbm)} in HBM"
+    )
+    print(
+        f"  softmax transients LX-resident: {len(transient_lx)} "
+        f"({'OK — on-chip' if transient_lx else 'NONE — tiling bought no residency'})"
+    )
+    print(
+        f"  K/V page reads in HBM: {len(page_hbm)} "
+        f"(expected: the both-pages hoist round-trips DRAM by design)"
+    )
+    if hbm:
+        # Group HBM reasons for a compact diagnostic.
+        from collections import Counter
+
+        reasons = Counter(r[2] for r in hbm)
+        for reason, n in reasons.most_common():
+            print(f"    HBM×{n}: {reason}")
+    return bool(transient_lx)
 
 
 def _assert_device_profiler_active(prof) -> None:
@@ -427,8 +554,8 @@ def main():
         "--query-len",
         type=int,
         default=512,
-        help="padded query length (lq). tile_lq only takes effect at "
-        ">= LQ_TILE_THRESHOLD (256); sweep long prefill (default 512).",
+        help="padded query length. tile_kv_heads only takes effect at "
+        ">= KV_HEAD_TILE_THRESHOLD (256); sweep long prefill (default 512).",
     )
     ap.add_argument("--device", default="spyre")
     ap.add_argument("--warmup", type=int, default=2)
@@ -445,15 +572,15 @@ def main():
         "--candidates",
         type=str,
         default="",
-        help="comma-separated tile_lq values to sweep; default = all divisors of "
-        "--query-len",
+        help="comma-separated tile_kv_heads values to sweep; default = all "
+        "divisors of --num-kv-heads",
     )
     ap.add_argument(
-        "--tile-qpk",
+        "--tile-q-heads",
         type=int,
         default=1,
-        help="fixed tile_qpk (num_queries_per_kv split) held constant across the "
-        "tile_lq sweep; default 1 (lq only)",
+        help="fixed tile_q_heads (num_queries_per_kv split) held constant across "
+        "the tile_kv_heads sweep; default 1 (kv_head only)",
     )
     ap.add_argument(
         "--allow-empty-device-profile",
@@ -467,6 +594,14 @@ def main():
         help="verify each tile>1 candidate emits a LoopSpec(count=sympify('N')) in "
         "the generated source (structural check the hint took effect), then exit "
         "without profiling/ranking",
+    )
+    ap.add_argument(
+        "--verify-residency",
+        action="store_true",
+        help="report which attention buffers are LX-resident vs written back to "
+        "HBM (the allocator's lx_pinning decisions): confirms the softmax "
+        "transients stay on-chip and shows the K/V page HBM round-trip the "
+        "both-pages hoist trades for it. Compiles each tile>1 candidate, then exits.",
     )
     args = ap.parse_args()
 
@@ -491,16 +626,17 @@ def main():
     _cfg_ctx.__enter__()
 
     num_queries_per_kv = args.num_query_heads // args.num_kv_heads
-    tile_qpk = args.tile_qpk
-    if num_queries_per_kv % tile_qpk != 0:
+    tile_q_heads = args.tile_q_heads
+    if num_queries_per_kv % tile_q_heads != 0:
         raise SystemExit(
-            f"--tile-qpk={tile_qpk} must divide num_queries_per_kv={num_queries_per_kv}"
+            f"--tile-q-heads={tile_q_heads} must divide "
+            f"num_queries_per_kv={num_queries_per_kv}"
         )
 
     candidates = (
         [int(x) for x in args.candidates.split(",") if x]
         if args.candidates
-        else _divisors(args.query_len)
+        else _divisors(args.num_kv_heads)
     )
 
     inputs = _build_inputs(
@@ -514,32 +650,37 @@ def main():
     )
     ref = inputs["ref"]
 
-    # Verify-only mode: structural check that the hint emits a tiled loop, then
-    # exit. A candidate is checked if either query-dim tile is > 1.
-    if args.verify_loopspec:
+    # Verify-only modes: structural check that the hint emits a tiled loop, or
+    # residency report of LX-vs-HBM buffer placement, then exit. A candidate is
+    # checked only if it actually tiles some head dim (either count > 1).
+    def _tileable(tile_kv_heads: int) -> bool:
+        if args.num_kv_heads % tile_kv_heads != 0:
+            return False
+        if tile_kv_heads > 1 and args.num_kv_heads // tile_kv_heads < 2:
+            return False
+        return tile_kv_heads > 1 or tile_q_heads > 1
+
+    if args.verify_loopspec or args.verify_residency:
+        verify_fn = _verify_residency if args.verify_residency else _verify_loopspec
         all_ok = True
-        for tile_lq in candidates:
-            if args.query_len % tile_lq != 0:
+        for tile_kv_heads in candidates:
+            if not _tileable(tile_kv_heads):
                 continue
-            if tile_lq > 1 and args.query_len // tile_lq < 2:
-                continue
-            if tile_lq <= 1 and tile_qpk <= 1:
-                continue
-            all_ok &= _verify_loopspec(
+            all_ok &= verify_fn(
                 inputs,
-                tile_lq,
-                tile_qpk,
+                tile_kv_heads,
+                tile_q_heads,
                 args.head_size,
                 args.num_query_heads,
                 args.num_kv_heads,
             )
-        # os._exit skips the interpreter's atexit flush, so the [verify] lines
+        # os._exit skips the interpreter's atexit flush, so the printed lines
         # are lost unless stdout is drained first.
         sys.stdout.flush()
         os._exit(0 if all_ok else 1)
 
     # Startup guard: confirm the AIUPTI device profiler is active before ranking.
-    # Probe with tile_lq=1 (the no-op baseline) after a warmup so compile
+    # Probe with tile_kv_heads=1 (the no-op baseline) after a warmup so compile
     # events don't pollute the check.
     if not args.allow_empty_device_profile:
         probe_impl = _make_impl(
@@ -553,21 +694,21 @@ def main():
         _assert_device_profiler_active(probe)
 
     results = []
-    for tile_lq in candidates:
-        if args.query_len % tile_lq != 0:
-            print(f"skip tile_lq={tile_lq} (does not divide query_len={args.query_len})")
+    for tile_kv_heads in candidates:
+        if args.num_kv_heads % tile_kv_heads != 0:
+            print(f"skip tile_kv_heads={tile_kv_heads} (does not divide num_kv_heads={args.num_kv_heads})")
             continue
         # The backend clamps counts that leave a per-tile extent < 2 (see
         # _clamp_tile_count), so timing them would record a count that never runs.
-        if tile_lq > 1 and args.query_len // tile_lq < 2:
-            print(f"skip tile_lq={tile_lq} (per-tile extent < 2)")
+        if tile_kv_heads > 1 and args.num_kv_heads // tile_kv_heads < 2:
+            print(f"skip tile_kv_heads={tile_kv_heads} (per-tile extent < 2)")
             continue
 
         # One impl per candidate, reused across the correctness gate, warmup, and
         # profiled iterations so the per-length kernel is compiled once (during
         # the gate/warmup) and its compile cost stays out of the ranked metric.
         impl = _make_impl(
-            inputs, tile_lq, tile_qpk, args.head_size, args.num_query_heads, args.num_kv_heads
+            inputs, tile_kv_heads, tile_q_heads, args.head_size, args.num_query_heads, args.num_kv_heads
         )
 
         # Correctness gate.
@@ -575,8 +716,8 @@ def main():
         max_diff = (out.to("cpu") - ref).abs().max().item()
         correct = torch.allclose(out.to("cpu"), ref, atol=args.atol, rtol=args.rtol)
         if not correct:
-            print(f"tile_lq={tile_lq}: INCORRECT (max_diff={max_diff:.4g}); excluded")
-            results.append({"tile_lq": tile_lq, "correct": False, "max_diff": max_diff})
+            print(f"tile_kv_heads={tile_kv_heads}: INCORRECT (max_diff={max_diff:.4g}); excluded")
+            results.append({"tile_kv_heads": tile_kv_heads, "correct": False, "max_diff": max_diff})
             continue
 
         # Warmup, then profile args.iterations forwards and average (the
@@ -599,14 +740,15 @@ def main():
         )
         mem_share = (mem_us / metric * 100.0) if metric else 0.0
         print(
-            f"\ntile_qpk={tile_qpk} tile_lq={tile_lq}: device_time_total={metric:.3f}us/iter  "
+            f"\ntile_kv_heads={tile_kv_heads} tile_q_heads={tile_q_heads}: "
+            f"device_time_total={metric:.3f}us/iter  "
             f"memory_ops={mem_us:.3f}us ({mem_share:.1f}%)  max_diff={max_diff:.4g}"
         )
         print(table)
         results.append(
             {
-                "tile_qpk": tile_qpk,
-                "tile_lq": tile_lq,
+                "tile_kv_heads": tile_kv_heads,
+                "tile_q_heads": tile_q_heads,
                 "correct": True,
                 "max_diff": max_diff,
                 "device_time_total_us": metric,
@@ -625,7 +767,7 @@ def main():
 
     winner = ranked[0]
     print(
-        f"\nWinner: tile_qpk={tile_qpk} tile_lq={winner['tile_lq']} "
+        f"\nWinner: tile_kv_heads={winner['tile_kv_heads']} tile_q_heads={tile_q_heads} "
         f"({winner['device_time_total_us']:.3f}us total device time, "
         f"{winner['device_time_memory_us']:.3f}us in memory ops)"
     )
@@ -639,7 +781,11 @@ def main():
     )
     cfg_path = os.path.join(_TILE_CONFIG_DIR, fname)
     with open(cfg_path, "w") as f:
-        json.dump({"tile_qpk": tile_qpk, "tile_lq": winner["tile_lq"]}, f, indent=2)
+        json.dump(
+            {"tile_kv_heads": winner["tile_kv_heads"], "tile_q_heads": tile_q_heads},
+            f,
+            indent=2,
+        )
     print(f"Wrote {cfg_path}")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -658,11 +804,14 @@ def main():
                     "block_size": args.block_size,
                     "context_loop_iterations": args.context_loop_iterations,
                     "query_len": args.query_len,
-                    "tile_qpk": tile_qpk,
+                    "tile_q_heads": tile_q_heads,
                     "warmup": args.warmup,
                     "iterations": args.iterations,
                 },
-                "winner": {"tile_qpk": tile_qpk, "tile_lq": winner["tile_lq"]},
+                "winner": {
+                    "tile_kv_heads": winner["tile_kv_heads"],
+                    "tile_q_heads": tile_q_heads,
+                },
                 "candidates": results,
             },
             f,

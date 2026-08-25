@@ -329,6 +329,8 @@ def _run_spyre_attn_test(
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    tile_kv_heads: int | None = None,
+    tile_q_heads: int | None = None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # The compiled attention kernel targets the Spyre device. On CPU it routes
@@ -419,6 +421,8 @@ def _run_spyre_attn_test(
         sliding_window=sliding_window,
         kv_cache_dtype="auto",
         logits_soft_cap=soft_cap,
+        tile_kv_heads=tile_kv_heads,
+        tile_q_heads=tile_q_heads,
     )
 
     output = torch.empty_like(query).to(cache_device)
@@ -557,6 +561,42 @@ def test_spyre_attn_compiled_multi_seq(
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "tile_kv_heads",
+    [pytest.param(2, id="tile_kv_heads(2)"), pytest.param(4, id="tile_kv_heads(4)")],
+)
+def test_spyre_attn_kv_head_tiling(
+    default_vllm_config,
+    tile_kv_heads: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """kv_head coarse-tiling (query_len >= KV_HEAD_TILE_THRESHOLD) matches the
+    reference. kv_head is the only tileable axis: the query axes (qpk, lq) are
+    broadcast onto the K/V pages by the matmuls, so tiling them forces an
+    unresolvable slot-major->head-major page read-copy. kv_head is native to the
+    page, so with both pages hoisted the tiled read-copy is a clean slice.
+    """
+    _run_spyre_attn_test(
+        seq_lens=[(512, 512)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        tile_kv_heads=tile_kv_heads,
     )
 
 
