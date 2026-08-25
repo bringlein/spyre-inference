@@ -1,0 +1,678 @@
+# Copyright 2026 The Spyre-Inference Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tune the QUERY-axis coarse-tile counts (tile_qpk, tile_lq) for the Spyre
+online-softmax attention kernel, using torch profiling as the measurement.
+
+For one attention shape it sweeps tile_lq over a candidate list (and optionally a
+fixed tile_qpk), runs the kernel under torch.profiler, and ranks candidates by
+TOTAL self device (SPYRE / PrivateUse1) time — memory ops (Memcpy / Memset /
+restickify) INCLUDED, because keeping the gathered V page resident is precisely
+about avoiding on-device round-trips, so the ranking must count them. The
+memory-op share is reported separately as a diagnostic: a tiling that spills the
+page shows a larger share. Every candidate is correctness-gated against a CPU
+reference before it can win. The winning {"tile_qpk": Q, "tile_lq": L} is written
+to the shape-keyed JSON consumed by SpyreAttentionImpl (see
+spyre_attn._get_attn_tile_config), and a timestamped per-run JSON with all
+candidates + printed tables is saved for inspection.
+
+tile_lq only takes effect at padded_query_len >= LQ_TILE_THRESHOLD (the backend
+gates it), so sweep with --query-len >= 256 and --context-loop-iterations set so
+historical_len = kv_len - query_len >= 0.
+
+Run on the Spyre pod:
+    cd /home/ngl/helion-experiments/spyre-inference \\
+        && /opt/spyre-inference/bin/python examples/tune_attn_tiling.py \\
+        --head-size 128 --num-query-heads 32 --num-kv-heads 8 --block-size 128 \\
+        --query-len 512 --context-loop-iterations 4 --candidates 1,2,4
+"""
+
+import argparse
+import contextlib
+import json
+import os
+import sys
+from datetime import datetime
+
+import torch
+from torch.profiler import ProfilerActivity, profile
+
+from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.utils.torch_utils import set_random_seed
+
+from spyre_inference.custom_ops.utils import convert
+
+from spyre_inference.v1.attention.backends.spyre_attn import (
+    SpyreAttentionImpl,
+    SpyreAttentionMetadataBuilder,
+    SpyrePagedKVCache,
+    slot_major_kv_layout,
+    _TILE_CONFIG_DIR,
+    _attn_tile_config_filename,
+)
+
+
+def _to_cache_device(cache_cpu, device):
+    """Move a KV cache to device, pinning the slot-major layout on Spyre exactly
+    as the model runner allocates it (#551). Without it the index_copy_ scatter
+    in reshape_and_cache silently writes the wrong rows (torch-spyre#3705)."""
+    if device.type != "spyre":
+        return cache_cpu.to(device)
+    num_blocks, block_size, num_kv_heads, head_size = cache_cpu.shape
+    return cache_cpu.to(
+        device,
+        device_layout=slot_major_kv_layout(
+            num_blocks * block_size, num_kv_heads, head_size, cache_cpu.dtype
+        ),
+    )
+
+
+def _divisors(n: int) -> list[int]:
+    return [d for d in range(1, n + 1) if n % d == 0]
+
+
+def _build_inputs(
+    *,
+    head_size: int,
+    num_query_heads: int,
+    num_kv_heads: int,
+    block_size: int,
+    context_loop_iterations: int,
+    query_len: int,
+    device: str,
+    seed: int = 0,
+):
+    """Build a single-sequence attention input + metadata + CPU reference.
+
+    Mirrors the setup in tests/test_spyre_attn.py::_run_spyre_attn_test for one
+    sequence. Populates the KV cache directly (no reshape_and_cache) so the
+    profiled forward measures the online-softmax path.
+
+    context_loop_iterations is the online-softmax loop trip count (number of KV
+    blocks the kernel iterates). The KV length is derived as
+    context_loop_iterations * block_size (full blocks), so the caller names the
+    loop count directly instead of reasoning about ceil(kv_len / block_size).
+    """
+    from vllm.config import get_current_vllm_config
+
+    dtype = torch.float16
+    cache_num_blocks = 256  # physical page pool, unrelated to the loop count
+    set_random_seed(seed)
+    torch.set_default_device("cpu")
+
+    # Full-blocks workload: the loop runs exactly context_loop_iterations times.
+    kv_len = context_loop_iterations * block_size
+
+    scale = head_size**-0.5
+    num_queries_per_kv = num_query_heads // num_kv_heads
+
+    query = torch.randn(query_len, num_query_heads, head_size, dtype=dtype)
+    key = torch.randn(query_len, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(query_len, num_kv_heads, head_size, dtype=dtype)
+    k_pages_cpu = torch.zeros(cache_num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(cache_num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+
+    max_num_blocks_per_seq = (kv_len + block_size - 1) // block_size
+    block_table = torch.randint(
+        0, cache_num_blocks, (1, max_num_blocks_per_seq), dtype=torch.int32
+    )
+
+    historical_len = kv_len - query_len
+    # Historical context: pre-filled directly into the pages.
+    for token_idx in range(historical_len):
+        blk = block_table[0, token_idx // block_size].item()
+        off = token_idx % block_size
+        k_pages_cpu[blk][off] = torch.randn(num_kv_heads, head_size, dtype=dtype)
+        v_pages_cpu[blk][off] = torch.randn(num_kv_heads, head_size, dtype=dtype)
+    # Query-token KV: written into pages here (for the reference) and passed to
+    # forward() as key/value so reshape_and_cache writes the same slots.
+    slot_mapping = []
+    for token_idx in range(historical_len, kv_len):
+        blk = block_table[0, token_idx // block_size].item()
+        off = token_idx % block_size
+        k_pages_cpu[blk][off] = key[token_idx - historical_len]
+        v_pages_cpu[blk][off] = value[token_idx - historical_len]
+        slot_mapping.append(blk * block_size + off)
+    slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
+
+    seq_lens = torch.tensor([kv_len], dtype=torch.int32)
+    query_start_loc = torch.tensor([0, query_len], dtype=torch.int32)
+
+    vllm_config = get_current_vllm_config()
+    from unittest.mock import Mock
+
+    vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
+    vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
+
+    kv_cache_spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+    )
+    builder = SpyreAttentionMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["layers.0.self_attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    common = CommonAttentionMetadata(
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        seq_lens=seq_lens,
+        num_reqs=1,
+        num_actual_tokens=query_len,
+        max_query_len=query_len,
+        max_seq_len=kv_len,
+        block_table_tensor=block_table,
+        slot_mapping=slot_mapping,
+        causal=True,
+    )
+    attn_metadata = builder.build(common_prefix_len=0, common_attn_metadata=common)
+
+    cache_device = torch.device(device)
+    k_pages = _to_cache_device(k_pages_cpu, cache_device)
+    v_pages = _to_cache_device(v_pages_cpu, cache_device)
+
+    ref = _ref_attn(
+        query, k_pages_cpu, v_pages_cpu, query_len, kv_len, block_table, block_size, scale
+    )
+
+    # Measure 1: convert q/k/v to the pages' device ONCE here, so the profiled
+    # forward() does not include the per-call H2D transfer (which otherwise
+    # dominates and hides the on-device attention compute the tiling affects).
+    query_dev = convert(query, cache_device)
+    key_dev = convert(key, cache_device)
+    value_dev = convert(value, cache_device)
+
+    return {
+        "query": query_dev,
+        "key": key_dev,
+        "value": value_dev,
+        "k_pages": k_pages,
+        "v_pages": v_pages,
+        "attn_metadata": attn_metadata,
+        "scale": scale,
+        "num_queries_per_kv": num_queries_per_kv,
+        "cache_device": cache_device,
+        "ref": ref,
+    }
+
+
+def _ref_attn(query, key_cache, value_cache, query_len, kv_len, block_table, block_size, scale):
+    """Minimal single-sequence, full-causal reference (no alibi/soft-cap/window)."""
+    block_indices = block_table.cpu().numpy()[0, : (kv_len + block_size - 1) // block_size]
+    k = torch.cat([key_cache[i] for i in block_indices], dim=0)[:kv_len]
+    v = torch.cat([value_cache[i] for i in block_indices], dim=0)[:kv_len]
+    q = query * scale
+    if q.shape[1] != k.shape[1]:
+        rep = q.shape[1] // k.shape[1]
+        k = torch.repeat_interleave(k, rep, dim=1)
+        v = torch.repeat_interleave(v, rep, dim=1)
+    attn = torch.einsum("qhd,khd->hqk", q, k).float()
+    mask = torch.triu(torch.ones(query_len, kv_len), diagonal=kv_len - query_len + 1).bool()
+    attn.masked_fill_(mask, float("-inf"))
+    attn = torch.softmax(attn, dim=-1).to(v.dtype)
+    return torch.einsum("hqk,khd->qhd", attn, v)
+
+
+def _make_impl(inputs, tile_lq, tile_qpk, head_size, num_query_heads, num_kv_heads):
+    """Build one SpyreAttentionImpl for a candidate. Reused across warmup and
+    profiled iterations so the per-length compiled kernel is cached after the
+    first call and its compile cost does not enter the ranked device-time metric.
+    """
+    return SpyreAttentionImpl(
+        num_heads=num_query_heads,
+        head_size=head_size,
+        scale=inputs["scale"],
+        num_kv_heads=num_kv_heads,
+        tile_qpk=tile_qpk,
+        tile_lq=tile_lq,
+    )
+
+
+@torch.inference_mode()
+def _run_once(impl, inputs):
+    output = torch.empty_like(inputs["query"]).to(inputs["cache_device"])
+    kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
+    # q/k/v are already on the pages' device (converted once in _build_inputs);
+    # the metadata device mirrors (page_index_tables, slot_mapping_device) are
+    # populated by the first forward() and reused, so warmup calls take them out
+    # of the profiled window.
+    impl.forward(
+        layer=None,
+        query=inputs["query"],
+        key=inputs["key"],
+        value=inputs["value"],
+        kv_cache=kv_cache,
+        attn_metadata=inputs["attn_metadata"],
+        output=output,
+    )
+    return output
+
+
+@torch.inference_mode()
+def _verify_loopspec(
+    inputs, tile_lq, tile_qpk, head_size, num_query_heads, num_kv_heads
+) -> bool:
+    """Confirm the coarse-tile hint actually emitted a tiled loop.
+
+    Runs the real forward() under torch._inductor.utils.run_and_get_code with the
+    attention kernel forced to compile (impl._compile_attn = True), and checks the
+    generated inductor source for `LoopSpec(... count=sympify('N'))` for each
+    tiled query dim. This is the reliable structural signal that the hint took
+    effect, independent of the (IO-dominated) timing — see torch-spyre
+    tests/inductor/test_coarse_tile_e2e.py::test_hint_flash_attention_loopspec.
+
+    A dropped hint (e.g. tile bound to no loop var) emits no such LoopSpec.
+    """
+    import torch._dynamo
+    import torch._inductor.config
+    from torch._inductor.utils import run_and_get_code
+
+    # Both compile caches must be defeated or a later candidate silently reuses an
+    # earlier one's artifact and reports THAT candidate's tile count: the tile
+    # count reaches the compiler through the spyre_hint side-channel, not through
+    # the FX graph, so it does not participate in the FX-graph cache key.
+    prev_disable = torch._inductor.config.force_disable_caches
+    torch._inductor.config.force_disable_caches = True
+    torch._dynamo.reset()
+    try:
+        impl = SpyreAttentionImpl(
+            num_heads=num_query_heads,
+            head_size=head_size,
+            scale=inputs["scale"],
+            num_kv_heads=num_kv_heads,
+            tile_qpk=tile_qpk,
+            tile_lq=tile_lq,
+        )
+        # Force the attention kernel to compile regardless of the vLLM config mode
+        # (STOCK_TORCH_COMPILE), so run_and_get_code captures inductor source.
+        impl._compile_attn = True
+        output = torch.empty_like(inputs["query"]).to(inputs["cache_device"])
+        kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
+        _, source_codes = run_and_get_code(
+            impl.forward,
+            None,
+            inputs["query"],
+            inputs["key"],
+            inputs["value"],
+            kv_cache,
+            inputs["attn_metadata"],
+            output,
+        )
+    finally:
+        torch._inductor.config.force_disable_caches = prev_disable
+
+    src = "\n".join(source_codes)
+    checks = []
+    if tile_qpk > 1:
+        checks.append(("qpk", tile_qpk))
+    if tile_lq > 1:
+        checks.append(("lq", tile_lq))
+    all_found = "LoopSpec(" in src and len(checks) > 0
+    parts = []
+    for name, count in checks:
+        needle = f"count=sympify('{count}')"
+        hit = needle in src
+        all_found &= hit
+        parts.append(f"{name}÷{count}={'ok' if hit else 'MISS'}")
+    print(
+        f"[verify] qpk={tile_qpk} lq={tile_lq}: "
+        f"{'FOUND' if all_found else 'MISSING'} [{', '.join(parts)}] "
+        f"({len(source_codes)} source module(s))"
+    )
+    return all_found
+
+
+def _assert_device_profiler_active(prof) -> None:
+    """Abort unless the probe profile carries real Spyre device events.
+
+    The AIUPTI backend is compiled into torch-spyre only when built with
+    USE_SPYRE_PROFILER=1 (spyre-inference pins it to "0" by default); without it
+    the PrivateUse1 slot is a silent no-op — the trace has CPU rows but zero
+    device events, so self_device_time_total is 0 everywhere and ranking would be
+    on noise. Detect that here rather than emit a meaningless config.
+    See docs/user_guide/kineto_profiling.md sec 1.1/1.3/1.4.
+    """
+    total = sum(getattr(ka, "self_device_time_total", 0.0) for ka in prof.key_averages())
+    if total <= 0.0:
+        raise SystemExit(
+            "No Spyre device events in the probe profile (self_device_time_total==0 "
+            "for every op). The AIUPTI profiler backend is not active, so ranking "
+            "would be on noise.\n"
+            "Rebuild torch-spyre with USE_SPYRE_PROFILER=1 (see "
+            "docs/user_guide/kineto_profiling.md sec 1.3), verify with "
+            "`ldd <torch_spyre/_C.so> | grep libaiupti`, or pass "
+            "--allow-empty-device-profile to override (not recommended)."
+        )
+
+
+def _device_times_us(prof) -> tuple[float, float]:
+    """Return (total_self_device_us, memory_op_self_device_us).
+
+    Total includes memory ops on purpose: keeping the gathered page resident is
+    exactly about avoiding on-device Memcpy/restickify round-trips, so the
+    ranking metric must count them. The memory-op sum is returned separately as
+    a diagnostic — a tiling that spills the page shows a larger memory share.
+    Memory ops matched by substring (restickify, memcpy, memset) so device-side
+    relayout copies count even when the exact op name varies.
+    """
+    total = 0.0
+    mem = 0.0
+    for ka in prof.key_averages():
+        t = getattr(ka, "self_device_time_total", 0.0)
+        total += t
+        name = ka.key.lower()
+        if any(m in name for m in ("memcpy", "memset", "restickify", "stickif")):
+            mem += t
+    return total, mem
+
+
+@contextlib.contextmanager
+def _spyre_vllm_config():
+    """Establish a Spyre vLLM config context for standalone (non-pytest) use.
+
+    Mirrors the default_vllm_config pytest fixture in
+    tests/plugin/spyre_testing_plugin/pytest_plugin.py so that
+    get_current_vllm_config() (called from SpyreAttentionMetadataBuilder /
+    _build_inputs) resolves outside of pytest.
+    """
+    from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
+    from vllm.config.compilation import CompilationConfig
+    from vllm.forward_context import set_forward_context
+    from vllm.platforms import PlatformEnum, current_platform
+    from spyre_inference.custom_ops import register_all
+
+    current_platform._enum = PlatformEnum.OOT
+    register_all()
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+        model_config=ModelConfig(dtype=torch.float16),
+    )
+    with set_current_vllm_config(config), set_forward_context(None, config):
+        yield
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--head-size", type=int, default=128)
+    ap.add_argument("--num-query-heads", type=int, default=32)
+    ap.add_argument("--num-kv-heads", type=int, default=8)
+    ap.add_argument("--block-size", type=int, default=128)
+    ap.add_argument(
+        "--context-loop-iterations",
+        type=int,
+        default=0,
+        help="online-softmax loop trip count = number of KV blocks the kernel "
+        "iterates; KV length is context_loop_iterations * block_size. Must be "
+        ">= 2 so the accumulation path (i>0) is exercised. Default (0) derives a "
+        "value so kv_len > query_len (adds one block of history) — pass an "
+        "explicit value to control the prefill history depth.",
+    )
+    ap.add_argument(
+        "--query-len",
+        type=int,
+        default=512,
+        help="padded query length (lq). tile_lq only takes effect at "
+        ">= LQ_TILE_THRESHOLD (256); sweep long prefill (default 512).",
+    )
+    ap.add_argument("--device", default="spyre")
+    ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument(
+        "--iterations",
+        type=int,
+        default=10,
+        help="profiled forward() calls per candidate; the device-time metric is "
+        "averaged over them to reduce jitter (default 10)",
+    )
+    ap.add_argument("--atol", type=float, default=0.3)
+    ap.add_argument("--rtol", type=float, default=0.2)
+    ap.add_argument(
+        "--candidates",
+        type=str,
+        default="",
+        help="comma-separated tile_lq values to sweep; default = all divisors of "
+        "--query-len",
+    )
+    ap.add_argument(
+        "--tile-qpk",
+        type=int,
+        default=1,
+        help="fixed tile_qpk (num_queries_per_kv split) held constant across the "
+        "tile_lq sweep; default 1 (lq only)",
+    )
+    ap.add_argument(
+        "--allow-empty-device-profile",
+        action="store_true",
+        help="skip the AIUPTI device-profiler startup check (ranks on noise if the "
+        "backend is inactive; not recommended)",
+    )
+    ap.add_argument(
+        "--verify-loopspec",
+        action="store_true",
+        help="verify each tile>1 candidate emits a LoopSpec(count=sympify('N')) in "
+        "the generated source (structural check the hint took effect), then exit "
+        "without profiling/ranking",
+    )
+    args = ap.parse_args()
+
+    # Derive a default loop count that adds one block of prefill history over the
+    # padded query length, so kv_len > query_len (historical_len > 0) — a
+    # representative long-prefill workload rather than the degenerate no-history
+    # case (kv_len == query_len). An explicit value overrides this.
+    if args.context_loop_iterations <= 0:
+        query_blocks = (args.query_len + args.block_size - 1) // args.block_size
+        args.context_loop_iterations = max(2, query_blocks + 1)
+    if args.context_loop_iterations * args.block_size < args.query_len:
+        raise SystemExit(
+            f"--context-loop-iterations={args.context_loop_iterations} gives "
+            f"kv_len={args.context_loop_iterations * args.block_size} < "
+            f"query_len={args.query_len}; increase it so kv_len >= query_len"
+        )
+
+    # Establish the vLLM config context for the whole run. Entered manually (not
+    # a `with` block) to avoid re-indenting the body; the script ends with
+    # os._exit(0), which bypasses context cleanup anyway.
+    _cfg_ctx = _spyre_vllm_config()
+    _cfg_ctx.__enter__()
+
+    num_queries_per_kv = args.num_query_heads // args.num_kv_heads
+    tile_qpk = args.tile_qpk
+    if num_queries_per_kv % tile_qpk != 0:
+        raise SystemExit(
+            f"--tile-qpk={tile_qpk} must divide num_queries_per_kv={num_queries_per_kv}"
+        )
+
+    candidates = (
+        [int(x) for x in args.candidates.split(",") if x]
+        if args.candidates
+        else _divisors(args.query_len)
+    )
+
+    inputs = _build_inputs(
+        head_size=args.head_size,
+        num_query_heads=args.num_query_heads,
+        num_kv_heads=args.num_kv_heads,
+        block_size=args.block_size,
+        context_loop_iterations=args.context_loop_iterations,
+        query_len=args.query_len,
+        device=args.device,
+    )
+    ref = inputs["ref"]
+
+    # Verify-only mode: structural check that the hint emits a tiled loop, then
+    # exit. A candidate is checked if either query-dim tile is > 1.
+    if args.verify_loopspec:
+        all_ok = True
+        for tile_lq in candidates:
+            if args.query_len % tile_lq != 0:
+                continue
+            if tile_lq > 1 and args.query_len // tile_lq < 2:
+                continue
+            if tile_lq <= 1 and tile_qpk <= 1:
+                continue
+            all_ok &= _verify_loopspec(
+                inputs,
+                tile_lq,
+                tile_qpk,
+                args.head_size,
+                args.num_query_heads,
+                args.num_kv_heads,
+            )
+        # os._exit skips the interpreter's atexit flush, so the [verify] lines
+        # are lost unless stdout is drained first.
+        sys.stdout.flush()
+        os._exit(0 if all_ok else 1)
+
+    # Startup guard: confirm the AIUPTI device profiler is active before ranking.
+    # Probe with tile_lq=1 (the no-op baseline) after a warmup so compile
+    # events don't pollute the check.
+    if not args.allow_empty_device_profile:
+        probe_impl = _make_impl(
+            inputs, 1, 1, args.head_size, args.num_query_heads, args.num_kv_heads
+        )
+        _run_once(probe_impl, inputs)
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+        ) as probe:
+            _run_once(probe_impl, inputs)
+        _assert_device_profiler_active(probe)
+
+    results = []
+    for tile_lq in candidates:
+        if args.query_len % tile_lq != 0:
+            print(f"skip tile_lq={tile_lq} (does not divide query_len={args.query_len})")
+            continue
+        # The backend clamps counts that leave a per-tile extent < 2 (see
+        # _clamp_tile_count), so timing them would record a count that never runs.
+        if tile_lq > 1 and args.query_len // tile_lq < 2:
+            print(f"skip tile_lq={tile_lq} (per-tile extent < 2)")
+            continue
+
+        # One impl per candidate, reused across the correctness gate, warmup, and
+        # profiled iterations so the per-length kernel is compiled once (during
+        # the gate/warmup) and its compile cost stays out of the ranked metric.
+        impl = _make_impl(
+            inputs, tile_lq, tile_qpk, args.head_size, args.num_query_heads, args.num_kv_heads
+        )
+
+        # Correctness gate.
+        out = _run_once(impl, inputs)
+        max_diff = (out.to("cpu") - ref).abs().max().item()
+        correct = torch.allclose(out.to("cpu"), ref, atol=args.atol, rtol=args.rtol)
+        if not correct:
+            print(f"tile_lq={tile_lq}: INCORRECT (max_diff={max_diff:.4g}); excluded")
+            results.append({"tile_lq": tile_lq, "correct": False, "max_diff": max_diff})
+            continue
+
+        # Warmup, then profile args.iterations forwards and average (the
+        # profiler accumulates events across all calls in the block, so the
+        # summed device time is divided by the iteration count).
+        for _ in range(args.warmup):
+            _run_once(impl, inputs)
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            record_shapes=True,
+        ) as prof:
+            for _ in range(args.iterations):
+                _run_once(impl, inputs)
+
+        total_us, total_mem_us = _device_times_us(prof)
+        metric = total_us / args.iterations
+        mem_us = total_mem_us / args.iterations
+        table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=20).replace(
+            "CUDA", "AIU"
+        )
+        mem_share = (mem_us / metric * 100.0) if metric else 0.0
+        print(
+            f"\ntile_qpk={tile_qpk} tile_lq={tile_lq}: device_time_total={metric:.3f}us/iter  "
+            f"memory_ops={mem_us:.3f}us ({mem_share:.1f}%)  max_diff={max_diff:.4g}"
+        )
+        print(table)
+        results.append(
+            {
+                "tile_qpk": tile_qpk,
+                "tile_lq": tile_lq,
+                "correct": True,
+                "max_diff": max_diff,
+                "device_time_total_us": metric,
+                "device_time_memory_us": mem_us,
+                "table": table,
+            }
+        )
+
+    ranked = sorted(
+        [r for r in results if r.get("correct")],
+        key=lambda r: r["device_time_total_us"],
+    )
+    if not ranked:
+        print("No correct candidate; not writing a config.")
+        sys.exit(1)
+
+    winner = ranked[0]
+    print(
+        f"\nWinner: tile_qpk={tile_qpk} tile_lq={winner['tile_lq']} "
+        f"({winner['device_time_total_us']:.3f}us total device time, "
+        f"{winner['device_time_memory_us']:.3f}us in memory ops)"
+    )
+
+    os.makedirs(_TILE_CONFIG_DIR, exist_ok=True)
+    fname = _attn_tile_config_filename(
+        args.head_size,
+        args.num_kv_heads,
+        num_queries_per_kv,
+        args.block_size,
+    )
+    cfg_path = os.path.join(_TILE_CONFIG_DIR, fname)
+    with open(cfg_path, "w") as f:
+        json.dump({"tile_qpk": tile_qpk, "tile_lq": winner["tile_lq"]}, f, indent=2)
+    print(f"Wrote {cfg_path}")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(os.path.dirname(__file__), "..", "tuning_runs")
+    os.makedirs(run_dir, exist_ok=True)
+    run_path = os.path.join(
+        run_dir, f"tune_attn_{fname.replace('.json', '')}_{ts}.json"
+    )
+    with open(run_path, "w") as f:
+        json.dump(
+            {
+                "shape": {
+                    "head_size": args.head_size,
+                    "num_query_heads": args.num_query_heads,
+                    "num_kv_heads": args.num_kv_heads,
+                    "block_size": args.block_size,
+                    "context_loop_iterations": args.context_loop_iterations,
+                    "query_len": args.query_len,
+                    "tile_qpk": tile_qpk,
+                    "warmup": args.warmup,
+                    "iterations": args.iterations,
+                },
+                "winner": {"tile_qpk": tile_qpk, "tile_lq": winner["tile_lq"]},
+                "candidates": results,
+            },
+            f,
+            indent=2,
+        )
+    print(f"Wrote {run_path}")
+
+    sys.stdout.flush()
+    os._exit(0)  # avoid TimestampCalibrator abort at teardown (see profile example)
+
+
+if __name__ == "__main__":
+    main()
