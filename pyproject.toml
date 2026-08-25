@@ -94,7 +94,7 @@ CMAKE_ARGS = "--fresh"
 
 # Disable the torch-spyre build-time profiler. This fixes long model load times on Z, but needs further investigation
 [tool.uv.extra-build-variables.torch-spyre]
-USE_SPYRE_PROFILER = "0"
+USE_SPYRE_PROFILER = "1"
 
 # vLLM and torch-spyre must be pulled from github to be built from source
 # NB: torch-spyre can only be compiled where `sendnn` is available
