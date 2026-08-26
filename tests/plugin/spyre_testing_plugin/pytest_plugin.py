@@ -13,10 +13,20 @@
 # limitations under the License.
 
 """
-pytest11 plugin for spyre-inference.
+pytest plugin for spyre-inference.
 
 This plugin integrates upstream vLLM tests with spyre-inference
 and filtering via a declarative YAML config (upstream_tests.yaml).
+
+Activation
+----------
+Loaded via `addopts = ["-p", "spyre_testing_plugin.pytest_plugin"]` in this repo's
+pyproject.toml rather than a pytest11 entry point, which would apply its autouse fixtures
+to every pytest session in the venv (e.g. a sibling torch-spyre checkout). Pass
+`-p spyre_testing_plugin.pytest_plugin` by hand to run it against a vLLM checkout.
+
+Upstream tests are opt-in: cloned and injected only when the `-m` expression can select
+the `upstream` marker, or `--upstream` is passed.
 
 Hook Execution Order
 ---------------------
@@ -31,14 +41,15 @@ Hook Execution Order
 
 3. pytest_collection_modifyitems
     - Applies skip/xfail markers based on YAML allow_list/block_list
-    - Applies tag markers for filtering (e.g., pytest -m rmsnorm)
+    - Applies tag markers for filtering (e.g., pytest -m "granite and upstream")
 
 4. pytest_fixture_setup (tryfirst)
     - Overrides default_vllm_config fixture with Spyre-specific config
 
 Environment Variables
 ---------------------
-SKIP_UPSTREAM_TESTS     Set to 1/true/yes to skip upstream test cloning
+SKIP_UPSTREAM_TESTS     Set to 1/true/yes to skip upstream test cloning, even when
+                        the -m expression or --upstream asks for them
 UPSTREAM_TESTS_PATHS    Comma-separated paths (default: auto from YAML)
 VLLM_COMMIT             Override vLLM commit (default: from pyproject.toml)
 VLLM_REPO_URL           Override vLLM repo URL
@@ -63,6 +74,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from _pytest.mark.expression import IDENT_PREFIX, Expression
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 import yaml
 
@@ -243,13 +255,12 @@ def _cache_root() -> Path:
     return base / "vllm-upstream-tests"
 
 
-def _extract_vllm_commit_from_pyproject() -> str:
+def _extract_vllm_commit_from_pyproject(repo_root_dir: Path) -> str:
     """
     Extract the vLLM git reference from pyproject.toml [tool.uv.sources] section.
     Raises FileNotFoundError if pyproject.toml is missing, or KeyError
     if the expected source entry is not found.
     """
-    repo_root_dir = Path(__file__).parent.parent.parent.parent
     pyproject_path = repo_root_dir / "pyproject.toml"
     if not pyproject_path.exists():
         raise FileNotFoundError(f"pyproject.toml not found in {repo_root_dir}")
@@ -276,7 +287,7 @@ def _extract_vllm_commit_from_pyproject() -> str:
     raise KeyError("Ensure vllm is specified with 'rev' in pyproject.toml [tool.uv.sources]")
 
 
-def _resolve_vllm_commit() -> str:
+def _resolve_vllm_commit(repo_root_dir: Path) -> str:
     """
     Resolve the vLLM git reference to use for cloning upstream tests.
     Priority: VLLM_COMMIT env var > pyproject.toml > error
@@ -289,7 +300,7 @@ def _resolve_vllm_commit() -> str:
         return env_commit
 
     # Extract from pyproject.toml
-    return _extract_vllm_commit_from_pyproject()
+    return _extract_vllm_commit_from_pyproject(repo_root_dir)
 
 
 def _run(cmd: list[str], cwd: Path | None = None, max_retries: int = 3) -> None:
@@ -393,9 +404,9 @@ def _ensure_repo_at_commit(repo_dir: Path, url: str, commit: str, sparse_paths: 
     return wt_dir
 
 
-def _prepare_upstream_tests_dir() -> Path:
+def _prepare_upstream_tests_dir(repo_root_dir: Path) -> Path:
     """Clone vLLM to cache and return path to tests directory."""
-    commit = _resolve_vllm_commit()
+    commit = _resolve_vllm_commit(repo_root_dir)
     cache_root = _cache_root()
     wt_dir = _ensure_repo_at_commit(
         repo_dir=cache_root,
@@ -430,8 +441,76 @@ def _temp_upstream_code_edits(upstream_tests_dir: Path):
 
 
 # ---------------------------------------------------------------------------
+# Upstream Opt-In
+# ---------------------------------------------------------------------------
+
+_UPSTREAM_MARKER = "upstream"
+# Satisfiability is brute-forced over the other markers (2**N evaluations); past this, fail open.
+_MAX_FREE_MARKERS = 12
+
+
+def _markexpr_selects_upstream(markexpr: str) -> bool:
+    """True when `markexpr` names `upstream` and is satisfiable with it set. Every marker
+    combo in the Makefile mentions `upstream`, most of them negatively, so a substring check
+    would be wrong. An expression that doesn't name it (`-m attention`) is not a request even
+    where it could match upstream tests; `--upstream` is the override for those.
+    """
+    try:
+        expr = Expression.compile(markexpr)
+    except SyntaxError:
+        # Let pytest report the malformed expression itself.
+        return False
+
+    # co_names is exactly the idents the evaluator will query, hyphens and dots included.
+    names = {n.removeprefix(IDENT_PREFIX) for n in expr._code.co_names}
+    if _UPSTREAM_MARKER not in names:
+        return False
+
+    free = sorted(names - {_UPSTREAM_MARKER})
+    if len(free) > _MAX_FREE_MARKERS:
+        return True
+
+    assignment: dict[str, bool] = {}
+
+    def matcher(name: str, /, **kwargs) -> bool:
+        return assignment.get(name, False)
+
+    for bits in range(1 << len(free)):
+        assignment = {name: bool(bits >> i & 1) for i, name in enumerate(free)}
+        assignment[_UPSTREAM_MARKER] = True
+        if expr.evaluate(matcher):
+            return True
+    return False
+
+
+def _upstream_requested(config) -> bool:
+    if os.environ.get("SKIP_UPSTREAM_TESTS", "").lower() in ("1", "true", "yes"):
+        _log("[vllm-upstream] SKIP_UPSTREAM_TESTS is set, skipping upstream test collection")
+        return False
+    if config.getoption("upstream"):
+        return True
+    if _markexpr_selects_upstream(config.option.markexpr):
+        return True
+    _log(
+        "[vllm-upstream] no `upstream` in the -m expression, skipping upstream test collection"
+        " (use -m upstream, or --upstream to add them to another marker expression)"
+    )
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Pytest Hooks
 # ---------------------------------------------------------------------------
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--upstream",
+        action="store_true",
+        default=False,
+        help="Collect upstream vLLM tests even when the -m expression doesn't name the "
+        "`upstream` marker (cloning vLLM if it isn't cached yet).",
+    )
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -441,7 +520,7 @@ def pytest_configure(config):
     _terminal_reporter = config.pluginmanager.get_plugin("terminalreporter")
 
     # Set env vars BEFORE any vllm imports
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
     # Load plugins early to register custom ops before test modules import RMSNorm
@@ -449,26 +528,24 @@ def pytest_configure(config):
 
     load_general_plugins()
 
+    config._upstream_tests_base = None
+    if not _upstream_requested(config):
+        return
+
     # Detect local vLLM repo or clone it
-    rootdir = Path(config.rootdir)
-    tests_dir = rootdir / "tests"
-    vllm_pkg = rootdir / "vllm"
+    # --rootdir can move config.rootdir off the pyproject.toml that pins the vLLM rev.
+    repo_root = Path(config.inipath).parent if config.inipath else Path(config.rootdir)
+    tests_dir = repo_root / "tests"
+    vllm_pkg = repo_root / "vllm"
 
     if tests_dir.is_dir() and vllm_pkg.is_dir():
         # Running from vLLM repo itself
         config._upstream_tests_base = tests_dir
         _log("[vllm-upstream] Using local vLLM tests")
     else:
-        # Not in vLLM repo - check if we should clone
-        skip_upstream = os.environ.get("SKIP_UPSTREAM_TESTS", "").lower() in ("1", "true", "yes")
-        if skip_upstream:
-            _log("[vllm-upstream] SKIP_UPSTREAM_TESTS is set, skipping upstream test collection")
-            config._upstream_tests_base = None
-            return
-
         try:
             # Clone vLLM to cache
-            upstream_tests_base = _prepare_upstream_tests_dir()
+            upstream_tests_base = _prepare_upstream_tests_dir(repo_root)
             _temp_upstream_code_edits(upstream_tests_base)
             config._upstream_tests_base = upstream_tests_base
 
@@ -727,7 +804,7 @@ def _spyre_session_config():
     plugin initialization. Tests that need a different config can still enter
     their own set_current_vllm_config context (nesting is safe).
     """
-    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops,spyre_inference_hf_adaptor"
+    os.environ["VLLM_PLUGINS"] = "spyre_inference,spyre_inference_ops"
     os.environ["VLLM_USE_AOT_COMPILE"] = "0"
 
     from vllm.plugins import load_general_plugins

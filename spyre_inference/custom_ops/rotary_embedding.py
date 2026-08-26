@@ -134,20 +134,8 @@ class _SpyreRotaryMixin:
         # Cache was primed in _apply before compile, so only the index_select is traced.
         cache = self._get_device_rotation_cache()
         rot = cache.index_select(0, positions.flatten()).view(-1, 2, 2, self._padded_inner)
-        out_query = _rotate_neox_2x2(
-            query,  # ty: ignore[invalid-argument-type]
-            rot,
-            self.head_size,
-        )
-        out_key = (
-            _rotate_neox_2x2(
-                key,  # ty: ignore[invalid-argument-type]
-                rot,
-                self.head_size,
-            )
-            if key is not None
-            else None
-        )
+        out_query = _rotate_neox_2x2(query, rot, self.head_size)
+        out_key = _rotate_neox_2x2(key, rot, self.head_size) if key is not None else None
         return out_query, out_key
 
 

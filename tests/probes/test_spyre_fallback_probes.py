@@ -20,7 +20,7 @@ xfail: when a primitive starts working in torch-spyre, the corresponding
 probe flips to XPASS and we can remove the associated workaround here.
 
 All tests run against the real Spyre device when available; otherwise they
-skip silently (the same pattern used by test_spyre_attn.py).
+skip silently (the same pattern used by attention/test_spyre_attn.py).
 """
 
 import pytest
@@ -96,7 +96,8 @@ def test_spyre_lm_head_unpadded_matmul_and_slice(spyre_device):
         "layout of x to carry x_var=d1' (out=1 case; out>=2 works, so this is "
         "distinct from the 64*(k*32) work-division limit in torch-spyre#1918). "
         "Fails in both eager and compile. "
-        "When supported, please adapt tests/test_mlp.py::test_replicated_matches_reference"
+        "When supported, please adapt "
+        "tests/custom_ops/test_mlp.py::test_replicated_matches_reference"
     ),
 )
 def test_spyre_matmul_output_dim_1(spyre_device, mode):
@@ -196,7 +197,7 @@ def test_spyre_single_row_index_select(spyre_device):
 
 
 # Note: the embedding single-row probe lives in
-# tests/test_vocab_parallel_embedding.py::test_single_token_embedding_on_device.
+# tests/custom_ops/test_vocab_parallel_embedding.py::test_single_token_embedding_on_device.
 # It is intentionally not duplicated here.
 
 
@@ -768,3 +769,29 @@ def test_spyre_slot_major_scatter_strided_source(spyre_device):
     written = got.ne(0).any(-1).any(-1).nonzero().flatten().tolist()
     assert written == sorted(slots.tolist()), f"scatter hit the wrong rows: {written}"
     torch.testing.assert_close(got, expected, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# 9. Scalar pow
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch.pow(x, 3) returns |x| ** 4 on Spyre, so gelu_new degenerates to "
+        "the identity for negative inputs. Exponents 2 and 4 are correct. When "
+        "this passes, drop custom_ops/activation.py::SpyreNewGELU. Tracked by "
+        "torch-spyre#4009."
+    ),
+)
+def test_spyre_scalar_pow_cube(spyre_device):
+    """torch.pow with exponent 3 on a device-produced tensor."""
+    # x has to come from an on-device op: a host-copied tensor of unaligned width
+    # is re-tiled and the comparison stops being meaningful.
+    a = torch.randn(8, 256, dtype=torch.float16, device=spyre_device)
+    b = torch.randn(256, 3072, dtype=torch.float16, device=spyre_device) / 32
+    x = a @ b
+
+    expected = x.cpu().float() ** 3
+    torch.testing.assert_close(torch.pow(x, 3).cpu().float(), expected, atol=1e-1, rtol=5e-2)

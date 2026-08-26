@@ -78,7 +78,9 @@ COVERAGE_ENV :=
 endif
 
 # Map TEST_TYPE to a pytest -m marker expression. regression -> no filter
-# (all tests). MARK_OVERRIDE bypasses TEST_TYPE entirely for callers that
+# (all tests) plus --upstream, since upstream tests are opt-in and an empty
+# marker expression no longer selects them.
+# MARK_OVERRIDE bypasses TEST_TYPE entirely for callers that
 # need a marker expression finer than the 3 coarse tiers (e.g. CI splitting
 # the "regression"-only upstream suites into separate parallel jobs) -- set
 # MARK_OVERRIDE and the TEST_TYPE mapping below is skipped.
@@ -92,8 +94,10 @@ ifneq ($(MARK_OVERRIDE),)
 MARK_EXPR := -m "$(MARK_OVERRIDE)"
 else ifeq ($(TEST_TYPE),regression)
 MARK_EXPR :=
+UPSTREAM_ARG := --upstream
 else ifeq ($(TEST_TYPE),trunk)
 MARK_EXPR :=
+UPSTREAM_ARG := --upstream
 else ifeq ($(TEST_TYPE),perf)
 MARK_EXPR :=
 else ifeq ($(TEST_TYPE),integration)
@@ -165,7 +169,7 @@ run-one: ## Internal: one pytest invocation for the resolved MARK_EXPR/JUNIT_ARG
 	# that failure (handled by AIU_SETUP_CMD's set +e/-e wrap).
 	$(AIU_SETUP_CMD); \
 	echo "Running tests for TEST_TYPE=$(TEST_TYPE) MARK_OVERRIDE=$(MARK_OVERRIDE)..."; \
-	$(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(JUNIT_ARGS)
+	$(COVERAGE_ENV) uv run --active --no-sync pytest $(PYTEST_ARGS) $(MARK_EXPR) $(UPSTREAM_ARG) $(JUNIT_ARGS)
 
 test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-attention, non-compile).
 	$(MAKE) run-one MARK_OVERRIDE='not (distributed or upstream or attention or compile)' JUNIT_XML=$(JUNIT_XML)
