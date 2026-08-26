@@ -591,7 +591,7 @@ def test_spyre_attn_kv_head_tiling(
     page, so with both pages hoisted the tiled read-copy is a clean slice.
     """
     _run_spyre_attn_test(
-        seq_lens=[(512, 512)],
+        seq_lens=[(1024, 1024)],
         block_size=128,
         sliding_window=None,
         configure_compilation=configure_compilation,

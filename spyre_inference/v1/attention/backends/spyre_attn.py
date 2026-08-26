@@ -87,10 +87,21 @@ INT32_ELEMS_PER_STICK = 32
 _TILE_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
 
 # kv_head tiling is enabled only at long prefill; below this padded_query_len it
-# is measured HARMFUL (Plan 8: +9% at lq=32, +20.8% decode). The tuned config's
-# `tile_kv_heads` is therefore applied only when padded_query_len >= this value.
+# is measured HARMFUL. Device-time micro-benchmark (bs=1, head_size=128, 8 kv /
+# 4 q-per-kv): query_len=512 regresses ~5%, query_len=1024 improves ~6% (tile=2),
+# query_len=2048 improves ~4% (tile=4). The crossover is between 512 and 1024, so
+# the gate is 1024. The win is from smaller on-chip transients (compute-kernel
+# scheduling), not memory-op reduction (mem-op time stays ~0.3-1% throughout).
 # `tile_q_heads` (qpk) has no such gate (it is a small, workload-fixed axis).
-KV_HEAD_TILE_THRESHOLD = 256
+KV_HEAD_TILE_THRESHOLD = 1024
+
+# Upper bound: above this padded_query_len, kv_head tiling is DISABLED. The
+# both-pages HBM hoist plus the tiled per-block transients over many blocks
+# exceed the 16 GB card at extreme prefill (measured OOM at query_len=8192 /
+# 64 blocks: FlexAllocator requested ~15 GB; untiled 8192 fits). 4096 (32 blocks)
+# still fits, so the safe window is [KV_HEAD_TILE_THRESHOLD, this]. Above it the
+# kernel falls back to untiled instead of OOMing.
+KV_HEAD_TILE_MAX_QUERY_LEN = 4096
 
 
 def _attn_tile_config_filename(
@@ -1154,9 +1165,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _resolve_tile_counts(self, block_size: int, padded_query_len: int) -> tuple[int, int]:
         """(tile_kv_heads, tile_q_heads): explicit overrides, else tuned config.
 
-        `tile_kv_heads` is gated on padded_query_len >= KV_HEAD_TILE_THRESHOLD:
-        kv_head tiling only helps at long prefill and is measured harmful at
-        decode/short prefill (Plan 8), so short lengths keep tile_kv_heads == 1.
+        `tile_kv_heads` is gated to the window
+        [KV_HEAD_TILE_THRESHOLD, KV_HEAD_TILE_MAX_QUERY_LEN]: below the lower
+        bound tiling is measured harmful (decode/short prefill), above the upper
+        bound the both-pages hoist + tiled transients OOM the card (measured at
+        query_len=8192). Outside the window kv_head tiling is forced off.
         """
         if (
             self._tile_kv_heads_override is not None
@@ -1177,7 +1190,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 if self._tile_q_heads_override is not None
                 else cfg["tile_q_heads"]
             )
-        if padded_query_len < KV_HEAD_TILE_THRESHOLD:
+        if not (KV_HEAD_TILE_THRESHOLD <= padded_query_len <= KV_HEAD_TILE_MAX_QUERY_LEN):
             kv_heads = 1
         return kv_heads, q_heads
 
