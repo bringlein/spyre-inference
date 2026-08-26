@@ -17,7 +17,6 @@ dependencies = [
     # Listing as a direct dep to ensure this is picked up from the pytorch-cpu index
     # Version intentionally left out: Compatibility is determined by torch-spyre and vllm
     "torch",
-    "hf-adapters-spyre"
 ]
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -33,7 +32,6 @@ spyre_inference = "spyre_inference:register"
 
 [project.entry-points."vllm.general_plugins"]
 spyre_inference_ops = "spyre_inference:register_ops"
-spyre_inference_hf_adaptor = "spyre_inference:register_hf_adapters"
 
 [tool.setuptools.packages.find]
 where = ["."]  # list of folders that contain the packages (["."] by default)
@@ -83,7 +81,13 @@ override-dependencies = [
 
     # requests is used by many dependencies, make sure it's patched for CVEs
     "requests>=2.32.4",
+
+    # pyzmq (transitive vllm dep, built from sdist on ppc64le/s390x) <27.2.0 fails to build
+    # against Cython 3.2+ (its bundled zmq/backend/cython/_zmq.py has Cython-invalid
+    # redeclarations); 27.2.0 fixed the generated code. vllm only requires pyzmq>=25.0.0.
+    "pyzmq>=27.2.0",
 ]
+
 # This ensures that we build vLLM with no device-specific C kernels (empty backend).
 # This avoids the torch version coupling of prebuilt CPU wheels and removes the dependency
 # on vllm._C (which provides CPU-optimized ops we don't need — Spyre has its own).
@@ -104,7 +108,6 @@ vllm = [
   { git = "https://github.com/vllm-project/vllm", rev = "v0.27.1" },
 ]
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "a31289852145a59099edccc3e506cf5336e8e2e0" }
-hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "a1e0b01e01b77d7b995c4ecd11ecaf30a19d7ba4" }
 torch = [
   # Power has no prebuilt wheels on the pytorch-cpu index; build from source at the
   # tag matching the runtime pin. Everything else keeps the fast CPU-wheel path.

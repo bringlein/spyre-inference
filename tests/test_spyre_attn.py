@@ -186,6 +186,15 @@ def assert_close_outliers(
         outlier_rtol: relative tolerance for outlier elements.
         msg: additional context for the failure message.
     """
+    # `NaN > tol` is False, so a non-finite actual scores zero outliers and passes
+    # the check below. Attention output is always finite, so reject it up front.
+    n_nonfinite = int((~torch.isfinite(actual)).sum())
+    if n_nonfinite:
+        raise AssertionError(
+            f"{n_nonfinite}/{actual.numel()} element(s) of actual are non-finite "
+            f"(NaN or inf); the value was never written or the kernel diverged."
+        )
+
     diff = (actual - expected).abs()
     tol = atol + rtol * expected.abs()
     outlier_mask = diff > tol
@@ -331,6 +340,7 @@ def _run_spyre_attn_test(
     head_size: int = 128,
     tile_kv_heads: int | None = None,
     tile_q_heads: int | None = None,
+    expect_fused_store: bool | None = None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # The compiled attention kernel targets the Spyre device. On CPU it routes
@@ -425,7 +435,9 @@ def _run_spyre_attn_test(
         tile_q_heads=tile_q_heads,
     )
 
-    output = torch.empty_like(query).to(cache_device)
+    # NaN, not empty_like: every row is expected to be written, so a store that
+    # lands nowhere fails below instead of passing on whatever the allocator gave.
+    output = torch.full_like(query, float("nan")).to(cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
     # The impl expects q/k/v already on device, as in production (QKV runs
@@ -439,6 +451,15 @@ def _run_spyre_attn_test(
         attn_metadata=attn_metadata,
         output=output,
     )
+
+    if expect_fused_store is not None:
+        # Kernel cache keys are
+        # (num_blocks, padded_query_len, tile_kv_heads, tile_q_heads, store_mode, store_len).
+        fused_used = any(key[4] != "none" for key in attn_impl._attn_fns)
+        assert fused_used == expect_fused_store, (
+            f"fused output store: expected {expect_fused_store}, got {fused_used} "
+            f"(kernel cache keys: {sorted(attn_impl._attn_fns)})"
+        )
 
     ref_output = ref_attn(
         query=query,
@@ -542,6 +563,7 @@ def test_spyre_attn_core(
         pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
         pytest.param([(1, 256), (32, 256), (1, 512)], id="batch_mixed(3seqs)"),
+        pytest.param([(1, 128), (1, 256), (1, 128)], id="probe_decode_3seqs_kv128"),
     ],
 )
 def test_spyre_attn_compiled_multi_seq(
@@ -597,6 +619,46 @@ def test_spyre_attn_kv_head_tiling(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         tile_kv_heads=tile_kv_heads,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("configure_compilation", "seq_lens", "expect_fused_store"),
+    [
+        pytest.param("STOCK_TORCH_COMPILE", [(1, 512)], True, id="STOCK-decode(1seq)-fused"),
+        pytest.param("STOCK_TORCH_COMPILE", [(32, 256)], True, id="STOCK-prefill(1seq)-fused"),
+        pytest.param(
+            "STOCK_TORCH_COMPILE",
+            [(1, 256), (1, 512)],
+            True,
+            id="STOCK-decode(2seqs)-fused",
+        ),
+        pytest.param("NONE", [(1, 512)], False, id="NONE-decode(1seq)-eager"),
+    ],
+    indirect=["configure_compilation"],
+)
+def test_spyre_attn_fused_output_store(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    expect_fused_store: bool,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Assert both the output and which store path ran, so a guard that stops
+    engaging cannot leave these cases green on the eager store alone.
+    """
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        expect_fused_store=expect_fused_store,
     )
 
 

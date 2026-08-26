@@ -38,24 +38,18 @@ def register():
 
 
 def register_ops():
-    """Register OOT custom ops for Spyre."""
+    """Register the Spyre OOT custom ops and Transformers backend."""
+    from vllm.model_executor.models import ModelRegistry
+
     from spyre_inference.custom_ops import register_all
 
     register_all()
 
-
-def register_hf_adapters():
-    # Override the Transformers backend model class so that
-    # ``model_impl="transformers"`` uses hf-adapters'
-    try:
-        from vllm.model_executor.models import ModelRegistry
-
-        ModelRegistry.register_model(
-            "TransformersForCausalLM",
-            "spyre_inference.hf_adapters:HfAdaptersForCausalLM",
-        )
-    except Exception:
-        logger.warning("Failed to register hf-adapters Transformers backend", exc_info=True)
+    # So that ``model_impl="transformers"`` picks up the Spyre RoPE adaptation.
+    ModelRegistry.register_model(
+        "TransformersForCausalLM",
+        "spyre_inference.transformers_backend:SpyreTransformersForCausalLM",
+    )
 
 
 def _init_logging():
