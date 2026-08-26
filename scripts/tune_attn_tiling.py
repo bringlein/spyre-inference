@@ -12,29 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tune the HEAD-axis coarse-tile counts (tile_kv_heads, tile_q_heads) for the
-Spyre online-softmax attention kernel, using torch profiling as the measurement.
+"""Tune the head-axis coarse-tile counts (tile_kv_heads, tile_q_heads) for the
+Spyre online-softmax attention kernel by torch profiling.
 
-For one attention shape it sweeps tile_kv_heads over a candidate list (and
-optionally a fixed tile_q_heads), runs the kernel under torch.profiler, and ranks
-candidates by TOTAL self device (SPYRE / PrivateUse1) time — memory ops (Memcpy /
-Memset / restickify) INCLUDED, because head-axis tiling shrinks the on-device
-transients precisely to avoid spill/refill round-trips, so the ranking must count
-them. The memory-op share is reported separately as a diagnostic. Every candidate
-is correctness-gated against a CPU reference before it can win. The winning
-{"tile_kv_heads": K, "tile_q_heads": Q} is written to the shape-keyed JSON consumed
-by SpyreAttentionImpl (see spyre_attn._get_attn_tile_config), and a timestamped
-per-run JSON with all candidates + printed tables is saved for inspection.
+Sweeps tile_kv_heads for one attention shape and ranks candidates by total self
+device time (memory ops included, since tiling trades page IO for on-chip
+transients). Each candidate is correctness-gated against the untiled device
+baseline; the winner is written to the shape-keyed JSON that SpyreAttentionImpl
+loads (spyre_attn._get_attn_tile_config).
 
-tile_kv_heads only takes effect at padded_query_len >= KV_HEAD_TILE_THRESHOLD (the
-backend gates it), so sweep with --query-len >= 256 and --context-loop-iterations
-set so historical_len = kv_len - query_len >= 0.
+tile_kv_heads only takes effect at padded_query_len >= KV_HEAD_TILE_THRESHOLD, so
+sweep with --query-len in the gated window.
 
-Run on the Spyre pod:
-    cd /home/ngl/helion-experiments/spyre-inference \\
-        && /opt/spyre-inference/bin/python examples/tune_attn_tiling.py \\
-        --head-size 128 --num-query-heads 32 --num-kv-heads 8 --block-size 128 \\
-        --query-len 512 --context-loop-iterations 4 --candidates 1,2,4
+    python scripts/tune_attn_tiling.py --query-len 1024 --candidates 1,2,4
 """
 
 import argparse
@@ -66,9 +56,9 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 
 
 def _to_cache_device(cache_cpu, device):
-    """Move a KV cache to device, pinning the slot-major layout on Spyre exactly
-    as the model runner allocates it (#551). Without it the index_copy_ scatter
-    in reshape_and_cache silently writes the wrong rows (torch-spyre#3705)."""
+    """Move a KV cache to device, pinning the slot-major layout on Spyre as the
+    model runner does (#551); without it reshape_and_cache scatters wrong rows
+    (torch-spyre#3705)."""
     if device.type != "spyre":
         return cache_cpu.to(device)
     num_blocks, block_size, num_kv_heads, head_size = cache_cpu.shape
@@ -98,16 +88,11 @@ def _build_inputs(
 ):
     """Build a batch_size-sequence attention input + metadata + CPU reference.
 
-    Mirrors the setup in tests/test_spyre_attn.py::_run_spyre_attn_test. All
-    sequences share query_len/kv_len (uniform padded length) so the compiled
-    kernel is reused; forward()'s per-seq loop calls it once per sequence.
-    Populates the KV cache directly (no reshape_and_cache) so the profiled
-    forward measures the online-softmax path.
-
-    context_loop_iterations is the online-softmax loop trip count (number of KV
-    blocks the kernel iterates). The KV length is derived as
-    context_loop_iterations * block_size (full blocks), so the caller names the
-    loop count directly instead of reasoning about ceil(kv_len / block_size).
+    All sequences share query_len/kv_len so the compiled kernel is reused across
+    the per-seq forward() loop. The KV cache is populated directly (no
+    reshape_and_cache) so the profiled forward measures the online-softmax path.
+    context_loop_iterations is the KV-block loop trip count; kv_len =
+    context_loop_iterations * block_size.
     """
     from vllm.config import get_current_vllm_config
 
@@ -116,17 +101,11 @@ def _build_inputs(
     set_random_seed(seed)
     torch.set_default_device("cpu")
 
-    # Full-blocks workload: the loop runs exactly context_loop_iterations times.
     kv_len = context_loop_iterations * block_size
 
     scale = head_size**-0.5
     num_queries_per_kv = num_query_heads // num_kv_heads
 
-    # All sequences share the same query_len/kv_len so the compiled kernel is
-    # reused across the batch (uniform padded length); the forward() per-seq loop
-    # invokes it once per sequence. This measures whether batching (N kernel
-    # calls) changes the per-forward device time linearly and leaves the tiling
-    # win unchanged.
     k_pages_cpu = torch.zeros(cache_num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
     v_pages_cpu = torch.zeros(cache_num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
     max_num_blocks_per_seq = (kv_len + block_size - 1) // block_size
@@ -152,8 +131,7 @@ def _build_inputs(
             off = token_idx % block_size
             k_pages_cpu[blk][off] = torch.randn(num_kv_heads, head_size, dtype=dtype)
             v_pages_cpu[blk][off] = torch.randn(num_kv_heads, head_size, dtype=dtype)
-        # Query-token KV: written into pages (for the ref) and passed to forward()
-        # as key/value so reshape_and_cache writes the same slots.
+        # Query-token KV: written into pages (for the ref) and passed to forward().
         for token_idx in range(historical_len, kv_len):
             blk = block_table_s[0, token_idx // block_size].item()
             off = token_idx % block_size
@@ -216,9 +194,8 @@ def _build_inputs(
     k_pages = _to_cache_device(k_pages_cpu, cache_device)
     v_pages = _to_cache_device(v_pages_cpu, cache_device)
 
-    # Measure 1: convert q/k/v to the pages' device ONCE here, so the profiled
-    # forward() does not include the per-call H2D transfer (which otherwise
-    # dominates and hides the on-device attention compute the tiling affects).
+    # Convert q/k/v to the pages' device ONCE here so the profiled forward()
+    # excludes the per-call H2D transfer (which would otherwise dominate).
     query_dev = convert(query, cache_device)
     key_dev = convert(key, cache_device)
     value_dev = convert(value, cache_device)
@@ -255,10 +232,8 @@ def _ref_attn(query, key_cache, value_cache, query_len, kv_len, block_table, blo
 
 
 def _make_impl(inputs, tile_kv_heads, tile_q_heads, head_size, num_query_heads, num_kv_heads):
-    """Build one SpyreAttentionImpl for a candidate. Reused across warmup and
-    profiled iterations so the per-length compiled kernel is cached after the
-    first call and its compile cost does not enter the ranked device-time metric.
-    """
+    """Build one SpyreAttentionImpl for a candidate, reused across warmup and
+    profiled iterations so compile cost stays out of the ranked metric."""
     return SpyreAttentionImpl(
         num_heads=num_query_heads,
         head_size=head_size,
@@ -273,10 +248,8 @@ def _make_impl(inputs, tile_kv_heads, tile_q_heads, head_size, num_query_heads, 
 def _run_once(impl, inputs):
     output = torch.empty_like(inputs["query"]).to(inputs["cache_device"])
     kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
-    # q/k/v are already on the pages' device (converted once in _build_inputs);
-    # the metadata device mirrors (page_index_tables, slot_mapping_device) are
-    # populated by the first forward() and reused, so warmup calls take them out
-    # of the profiled window.
+    # q/k/v are already on device; the metadata device mirrors are populated by
+    # the first forward() and reused, so warmup takes them out of the profile.
     impl.forward(
         layer=None,
         query=inputs["query"],
@@ -293,25 +266,20 @@ def _run_once(impl, inputs):
 def _verify_loopspec(
     inputs, tile_kv_heads, tile_q_heads, head_size, num_query_heads, num_kv_heads
 ) -> bool:
-    """Confirm the coarse-tile hint actually emitted a tiled loop.
+    """Confirm the coarse-tile hint emitted a tiled loop.
 
-    Runs the real forward() under torch._inductor.utils.run_and_get_code with the
-    attention kernel forced to compile (impl._compile_attn = True), and checks the
-    generated inductor source for `LoopSpec(... count=sympify('N'))` for each
-    tiled head dim. This is the reliable structural signal that the hint took
-    effect, independent of the (IO-dominated) timing — see torch-spyre
-    tests/inductor/test_coarse_tile_e2e.py::test_hint_flash_attention_loopspec.
-
-    A dropped hint (e.g. tile bound to no loop var) emits no such LoopSpec.
+    Compiles forward() under run_and_get_code and checks the generated source for
+    `LoopSpec(count=sympify('N'))` per tiled head dim — the structural signal the
+    hint took effect, independent of (IO-dominated) timing. A dropped hint emits
+    no such LoopSpec.
     """
     import torch._dynamo
     import torch._inductor.config
     from torch._inductor.utils import run_and_get_code
 
-    # Both compile caches must be defeated or a later candidate silently reuses an
-    # earlier one's artifact and reports THAT candidate's tile count: the tile
-    # count reaches the compiler through the spyre_hint side-channel, not through
-    # the FX graph, so it does not participate in the FX-graph cache key.
+    # Both compile caches must be defeated or a later candidate reuses an earlier
+    # artifact and reports its tile count: the count reaches the compiler through
+    # the spyre_hint side-channel, not the FX graph cache key.
     prev_disable = torch._inductor.config.force_disable_caches
     torch._inductor.config.force_disable_caches = True
     torch._dynamo.reset()
@@ -366,12 +334,9 @@ def _verify_loopspec(
 class _LxPinningCapture(logging.Handler):
     """Capture the allocator's per-buffer LX-vs-HBM residency decisions.
 
-    torch-spyre's scratchpad allocator logs one line per op at DEBUG:
-        lx_pinning: <buf> (<op_kind>) -> <reason>
-    `reason == "lx"` means the buffer stays resident in the LX scratchpad; any
-    other string is the first check it failed, i.e. it lives in HBM (round-trips
-    DRAM). We attach this handler around the compile so we don't depend on env
-    vars / stderr scraping, and classify each record.
+    torch-spyre logs one line per op at DEBUG: `lx_pinning: <buf> (<op>) -> <reason>`.
+    `reason == "lx"` means the buffer stays in the LX scratchpad; anything else
+    means it round-trips HBM.
     """
 
     _RE = re.compile(r"lx_pinning:\s*(\S+)\s*\(([^)]*)\)\s*(?:->|→)\s*(.+)")
@@ -392,25 +357,17 @@ def _verify_residency(
 ) -> bool:
     """Report which attention buffers are LX-resident vs written back to HBM.
 
-    Compiles the tiled kernel (like _verify_loopspec) while capturing the
-    allocator's `lx_pinning:` decisions. Prints a residency summary and, as a
-    diagnostic, flags the K/V page reads (expected in HBM under the both-pages
-    hoist) and the softmax transients (expected LX-resident — the actual win).
-
-    Returns True if at least some softmax transient stayed LX (the tiling
-    delivered on-chip residency); False if everything spilled to HBM (the tile
-    bought nothing), so the caller can treat it as a red flag. The K/V page HBM
-    round-trip is EXPECTED (the hoist trades it for keeping the transients
-    on-chip), so it is reported but does not fail the check.
+    Compiles the tiled kernel while capturing the allocator's `lx_pinning:`
+    decisions. Returns True if any softmax transient stayed LX (the win); the K/V
+    page HBM round-trip is expected under the both-pages hoist and does not fail.
     """
     import torch._dynamo
     import torch._inductor.config
     from torch._inductor.utils import run_and_get_code
 
-    # Ensure torch-spyre's logging is initialized and the allocator logger is at
-    # DEBUG BEFORE the compile, otherwise its lazy re-config on first use resets
-    # the level/handlers and the very first candidate emits nothing (the records
-    # exist under SPYRE_INDUCTOR_LOG but the in-process handler misses them).
+    # torch-spyre's logging must be initialized and the allocator logger set to
+    # DEBUG BEFORE the compile, else its lazy re-config drops the first candidate's
+    # records.
     try:
         from torch_spyre import logging_config as _spyre_log_cfg
 
@@ -456,14 +413,11 @@ def _verify_residency(
         alloc_logger.removeHandler(capture)
         alloc_logger.setLevel(prev_level)
 
-    # The reshape_and_cache kernels compile first and also emit lx_pinning lines;
-    # the attention kernel is the one carrying coarse_tile_* buffers. Restrict the
-    # report to records from a compile group that contains a coarse_tile buffer.
+    # The reshape_and_cache kernels also emit lx_pinning lines; the attention
+    # kernel is the one carrying coarse_tile_* buffers.
     lx = [r for r in capture.records if r[2] == "lx"]
     hbm = [r for r in capture.records if r[2] != "lx"]
-    # Page reads: the hoisted K/V gather slices feeding the matmuls appear as
-    # coarse_tile_read_copy_* of arg0/arg4 (the page args) or clones of the
-    # gathered page buffers.
+    # Page reads: hoisted K/V gather slices feeding the matmuls.
     page_hbm = [r for r in hbm if "read_copy" in r[0] and ("arg" in r[0] or "buf" in r[0])]
     transient_lx = [
         r for r in lx if r[1] in ("mul", "add", "sum", "div", "sub", "exp", "maximum", "amax")
@@ -494,35 +448,26 @@ def _verify_residency(
 def _assert_device_profiler_active(prof) -> None:
     """Abort unless the probe profile carries real Spyre device events.
 
-    The AIUPTI backend is compiled into torch-spyre only when built with
-    USE_SPYRE_PROFILER=1 (spyre-inference pins it to "0" by default); without it
-    the PrivateUse1 slot is a silent no-op — the trace has CPU rows but zero
-    device events, so self_device_time_total is 0 everywhere and ranking would be
-    on noise. Detect that here rather than emit a meaningless config.
-    See docs/user_guide/kineto_profiling.md sec 1.1/1.3/1.4.
+    The AIUPTI backend is compiled in only with USE_SPYRE_PROFILER=1; without it
+    self_device_time_total is 0 everywhere and ranking would be on noise. See
+    docs/user_guide/kineto_profiling.md.
     """
     total = sum(getattr(ka, "self_device_time_total", 0.0) for ka in prof.key_averages())
     if total <= 0.0:
         raise SystemExit(
-            "No Spyre device events in the probe profile (self_device_time_total==0 "
-            "for every op). The AIUPTI profiler backend is not active, so ranking "
-            "would be on noise.\n"
+            "No Spyre device events in the probe profile (self_device_time_total==0). "
+            "The AIUPTI profiler backend is not active, so ranking would be on noise. "
             "Rebuild torch-spyre with USE_SPYRE_PROFILER=1 (see "
-            "docs/user_guide/kineto_profiling.md sec 1.3), verify with "
-            "`ldd <torch_spyre/_C.so> | grep libaiupti`, or pass "
-            "--allow-empty-device-profile to override (not recommended)."
+            "docs/user_guide/kineto_profiling.md) or pass --allow-empty-device-profile."
         )
 
 
 def _device_times_us(prof) -> tuple[float, float]:
     """Return (total_self_device_us, memory_op_self_device_us).
 
-    Total includes memory ops on purpose: keeping the gathered page resident is
-    exactly about avoiding on-device Memcpy/restickify round-trips, so the
-    ranking metric must count them. The memory-op sum is returned separately as
-    a diagnostic — a tiling that spills the page shows a larger memory share.
-    Memory ops matched by substring (restickify, memcpy, memset) so device-side
-    relayout copies count even when the exact op name varies.
+    Total includes memory ops on purpose: tiling is about avoiding on-device
+    round-trips, so the ranking metric must count them. The memory sum is a
+    diagnostic. Matched by substring so relayout copies count as their name varies.
     """
     total = 0.0
     mem = 0.0
@@ -537,13 +482,8 @@ def _device_times_us(prof) -> tuple[float, float]:
 
 @contextlib.contextmanager
 def _spyre_vllm_config():
-    """Establish a Spyre vLLM config context for standalone (non-pytest) use.
-
-    Mirrors the default_vllm_config pytest fixture in
-    tests/plugin/spyre_testing_plugin/pytest_plugin.py so that
-    get_current_vllm_config() (called from SpyreAttentionMetadataBuilder /
-    _build_inputs) resolves outside of pytest.
-    """
+    """Establish a Spyre vLLM config context for standalone (non-pytest) use, so
+    get_current_vllm_config() resolves outside pytest."""
     from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
     from vllm.config.compilation import CompilationConfig
     from vllm.forward_context import set_forward_context
@@ -571,36 +511,29 @@ def main():
         "--context-loop-iterations",
         type=int,
         default=0,
-        help="online-softmax loop trip count = number of KV blocks the kernel "
-        "iterates; KV length is context_loop_iterations * block_size. Must be "
-        ">= 2 so the accumulation path (i>0) is exercised. Default (0) derives a "
-        "value so kv_len > query_len (adds one block of history) — pass an "
-        "explicit value to control the prefill history depth.",
+        help="KV-block loop trip count; kv_len = context_loop_iterations * "
+        "block_size. Must be >= 2. Default (0) derives a value so kv_len > "
+        "query_len (one block of history).",
     )
     ap.add_argument(
         "--query-len",
         type=int,
         default=512,
-        help="padded query length. tile_kv_heads only takes effect at "
-        ">= KV_HEAD_TILE_THRESHOLD (256); sweep long prefill (default 512).",
+        help="padded query length. tile_kv_heads only takes effect at >= KV_HEAD_TILE_THRESHOLD.",
     )
     ap.add_argument("--device", default="spyre")
     ap.add_argument(
         "--batch-size",
         type=int,
         default=1,
-        help="number of sequences per forward() (all share --query-len). The "
-        "attention kernel runs once per sequence, so this measures whether "
-        "batching scales per-forward device time linearly and leaves the tiling "
-        "win unchanged (default 1).",
+        help="sequences per forward(), all sharing --query-len (default 1)",
     )
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument(
         "--iterations",
         type=int,
         default=10,
-        help="profiled forward() calls per candidate; the device-time metric is "
-        "averaged over them to reduce jitter (default 10)",
+        help="profiled forward() calls per candidate, averaged (default 10)",
     )
     ap.add_argument("--atol", type=float, default=0.3)
     ap.add_argument("--rtol", type=float, default=0.2)
@@ -634,17 +567,13 @@ def main():
     ap.add_argument(
         "--verify-residency",
         action="store_true",
-        help="report which attention buffers are LX-resident vs written back to "
-        "HBM (the allocator's lx_pinning decisions): confirms the softmax "
-        "transients stay on-chip and shows the K/V page HBM round-trip the "
-        "both-pages hoist trades for it. Compiles each tile>1 candidate, then exits.",
+        help="report which attention buffers are LX-resident vs HBM (the "
+        "allocator's lx_pinning decisions), then exit",
     )
     args = ap.parse_args()
 
-    # Derive a default loop count that adds one block of prefill history over the
-    # padded query length, so kv_len > query_len (historical_len > 0) — a
-    # representative long-prefill workload rather than the degenerate no-history
-    # case (kv_len == query_len). An explicit value overrides this.
+    # Default loop count adds one block of prefill history over the padded query
+    # length (kv_len > query_len). An explicit value overrides this.
     if args.context_loop_iterations <= 0:
         query_blocks = (args.query_len + args.block_size - 1) // args.block_size
         args.context_loop_iterations = max(2, query_blocks + 1)
@@ -655,9 +584,7 @@ def main():
             f"query_len={args.query_len}; increase it so kv_len >= query_len"
         )
 
-    # Establish the vLLM config context for the whole run. Entered manually (not
-    # a `with` block) to avoid re-indenting the body; the script ends with
-    # os._exit(0), which bypasses context cleanup anyway.
+    # Enter the vLLM config context for the whole run (torn down by os._exit).
     _cfg_ctx = _spyre_vllm_config()
     _cfg_ctx.__enter__()
 
@@ -686,9 +613,7 @@ def main():
     )
     ref = inputs["ref"]
 
-    # Verify-only modes: structural check that the hint emits a tiled loop, or
-    # residency report of LX-vs-HBM buffer placement, then exit. A candidate is
-    # checked only if it actually tiles some head dim (either count > 1).
+    # Verify-only modes: structural loopspec check or residency report, then exit.
     def _tileable(tile_kv_heads: int) -> bool:
         if args.num_kv_heads % tile_kv_heads != 0:
             return False
@@ -710,14 +635,11 @@ def main():
                 args.num_query_heads,
                 args.num_kv_heads,
             )
-        # os._exit skips the interpreter's atexit flush, so the printed lines
-        # are lost unless stdout is drained first.
+        # os._exit skips atexit flush, so drain stdout first.
         sys.stdout.flush()
         os._exit(0 if all_ok else 1)
 
     # Startup guard: confirm the AIUPTI device profiler is active before ranking.
-    # Probe with tile_kv_heads=1 (the no-op baseline) after a warmup so compile
-    # events don't pollute the check.
     if not args.allow_empty_device_profile:
         probe_impl = _make_impl(
             inputs, 1, 1, args.head_size, args.num_query_heads, args.num_kv_heads
@@ -731,12 +653,10 @@ def main():
 
     results = []
 
-    # In-family baseline: the UNTILED kernel output on device. A correct tile runs
-    # the same fp16 device math regrouped, so it must match this tightly; a broken
-    # tile diverges grossly. This is the reliable correctness signal — an absolute
-    # CPU-fp16-reference tolerance drifts with sequence length (more online-softmax
-    # steps => more accumulated fp16 error, e.g. tens of >0.6 outliers at kv~640
-    # that are noise, not bugs). The CPU ref is kept only as a coarse sanity floor.
+    # In-family baseline: the untiled kernel output on device. A correct tile runs
+    # the same fp16 device math regrouped, so it must match this tightly. The CPU
+    # ref drifts with sequence length (fp16 accumulation), so it is only a coarse
+    # sanity floor.
     baseline_impl = _make_impl(
         inputs, 1, 1, args.head_size, args.num_query_heads, args.num_kv_heads
     )
@@ -762,9 +682,8 @@ def main():
             print(f"skip tile_kv_heads={tile_kv_heads} (per-tile extent < 2)")
             continue
 
-        # One impl per candidate, reused across the correctness gate, warmup, and
-        # profiled iterations so the per-length kernel is compiled once (during
-        # the gate/warmup) and its compile cost stays out of the ranked metric.
+        # One impl per candidate, reused across the gate, warmup, and profiled
+        # iterations so compile cost stays out of the ranked metric.
         impl = _make_impl(
             inputs,
             tile_kv_heads,
@@ -774,13 +693,9 @@ def main():
             args.num_kv_heads,
         )
 
-        # Correctness gate: the tiled output runs the same fp16 device math as the
-        # untiled baseline, just regrouped, so per-element differences are fp16
-        # regrouping noise of the SAME magnitude as untiled-vs-CPU-ref (a handful
-        # of ~1.0 outliers over millions of elements). A structurally broken tile
-        # (dropped/wrong head, bad slice) instead diverges on a large FRACTION of
-        # elements. So gate on the outlier FRACTION, not max_diff: fail only if
-        # more than 0.1% of elements exceed a generous absolute threshold.
+        # Correctness gate on the outlier FRACTION, not max_diff: a correct tile
+        # differs from the untiled baseline only by fp16 regrouping noise (a few
+        # outliers), while a broken tile diverges on a large fraction of elements.
         out = _run_once(impl, inputs).to("cpu")
         adiff = (out - baseline).abs()
         max_diff = adiff.max().item()
@@ -796,9 +711,7 @@ def main():
             results.append({"tile_kv_heads": tile_kv_heads, "correct": False, "max_diff": max_diff})
             continue
 
-        # Warmup, then profile args.iterations forwards and average (the
-        # profiler accumulates events across all calls in the block, so the
-        # summed device time is divided by the iteration count).
+        # Warmup, then profile args.iterations forwards and average.
         for _ in range(args.warmup):
             _run_once(impl, inputs)
         with profile(

@@ -24,6 +24,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 from vllm.utils.torch_utils import set_random_seed
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
+    _KV_HEAD_TILE_MAX_WORKING_SET,
+    KV_HEAD_TILE_THRESHOLD,
     SpyreAttentionImpl,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
@@ -529,6 +531,7 @@ def _run_spyre_attn_test(
         pytest.param([(32, 256), (64, 512)], id="batch_prefill(2seqs)"),
         pytest.param([(64, 512), (32, 256)], id="batch_prefill(2seqs_swapped)"),
         pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
+        pytest.param([(1024, 1024)], id="long_prefill(q=1024,kv=1024)"),
     ],
 )
 def test_spyre_attn_core(
@@ -620,6 +623,66 @@ def test_spyre_attn_kv_head_tiling(
         configure_device=configure_device,
         tile_kv_heads=tile_kv_heads,
     )
+
+
+def _tiling_gate_impl() -> SpyreAttentionImpl:
+    return SpyreAttentionImpl(
+        num_heads=32,
+        head_size=128,
+        scale=1.0,
+        num_kv_heads=8,
+        kv_cache_dtype="auto",
+        tile_kv_heads=2,
+        tile_q_heads=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("padded_query_len", "expected_kv_tile"),
+    [
+        pytest.param(512, 1, id="below_threshold"),
+        pytest.param(KV_HEAD_TILE_THRESHOLD, 2, id="at_threshold"),
+        pytest.param(2048, 2, id="above_threshold"),
+    ],
+)
+def test_kv_head_tile_query_len_threshold(
+    default_vllm_config,
+    padded_query_len: int,
+    expected_kv_tile: int,
+) -> None:
+    """`_resolve_tile_counts` forces tile_kv_heads=1 below KV_HEAD_TILE_THRESHOLD
+    (short prefill/decode, where tiling is measured harmful). num_blocks is kept
+    small so the hoist budget is not the deciding gate. Pure-Python, no device.
+    """
+    impl = _tiling_gate_impl()
+    kv_heads, q_heads = impl._resolve_tile_counts(
+        block_size=128, padded_query_len=padded_query_len, num_blocks=8
+    )
+    assert kv_heads == expected_kv_tile
+    assert q_heads == 1
+
+
+def test_kv_head_tile_working_set_ceiling(default_vllm_config) -> None:
+    """`_resolve_tile_counts` disables tiling once the estimated tiled working set
+    exceeds _KV_HEAD_TILE_MAX_WORKING_SET — the OOM guard for extreme prefill —
+    without risking the OOM (pure-Python, no device). padded_query_len is held in
+    the tiling window so num_blocks alone crosses the ceiling.
+    """
+    impl = _tiling_gate_impl()
+    block_size = 128
+    padded_query_len = 2048
+    # working set = num_blocks * num_heads * padded_query_len * block_size
+    per_block = impl.num_heads * padded_query_len * block_size
+    ceiling_blocks = _KV_HEAD_TILE_MAX_WORKING_SET // per_block
+
+    kv_at, _ = impl._resolve_tile_counts(
+        block_size=block_size, padded_query_len=padded_query_len, num_blocks=ceiling_blocks
+    )
+    kv_over, _ = impl._resolve_tile_counts(
+        block_size=block_size, padded_query_len=padded_query_len, num_blocks=ceiling_blocks + 1
+    )
+    assert kv_at == 2, "working set exactly at the ceiling should still tile"
+    assert kv_over == 1, "working set over the ceiling must fall back to untiled"
 
 
 @pytest.mark.parametrize(

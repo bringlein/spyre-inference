@@ -86,22 +86,19 @@ INT32_ELEMS_PER_STICK = 32
 # (see _attn_tile_config_filename). Emitted by examples/tune_attn_tiling.py.
 _TILE_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
 
-# kv_head tiling is enabled only at long prefill; below this padded_query_len it
-# is measured HARMFUL. Device-time micro-benchmark (bs=1, head_size=128, 8 kv /
-# 4 q-per-kv): query_len=512 regresses ~5%, query_len=1024 improves ~6% (tile=2),
-# query_len=2048 improves ~4% (tile=4). The crossover is between 512 and 1024, so
-# the gate is 1024. The win is from smaller on-chip transients (compute-kernel
-# scheduling), not memory-op reduction (mem-op time stays ~0.3-1% throughout).
-# `tile_q_heads` (qpk) has no such gate (it is a small, workload-fixed axis).
+# kv_head tiling helps only at long prefill; below this it is measured harmful
+# (short prefill/decode regress ~5%). tile_q_heads (qpk) is not gated.
 KV_HEAD_TILE_THRESHOLD = 1024
 
-# Upper bound: above this padded_query_len, kv_head tiling is DISABLED. The
-# both-pages HBM hoist plus the tiled per-block transients over many blocks
-# exceed the 16 GB card at extreme prefill (measured OOM at query_len=8192 /
-# 64 blocks: FlexAllocator requested ~15 GB; untiled 8192 fits). 4096 (32 blocks)
-# still fits, so the safe window is [KV_HEAD_TILE_THRESHOLD, this]. Above it the
-# kernel falls back to untiled instead of OOMing.
-KV_HEAD_TILE_MAX_QUERY_LEN = 4096
+# Tiling co-allocates the per-block transients across the unrolled loop, OOMing
+# at extreme prefill. Ceiling = the tiled working set of the largest config that
+# ran (granite q=4096 / 32 blocks; q=8192 / 64 blocks OOM'd), estimated as the
+# score/prob element count summed over the loop (see _tiled_working_set) so it
+# scales with the head geometry in use, not a fixed query-length cutoff.
+# TODO: single-anchor estimate from one shape/card; re-measure the true OOM
+# boundary across head geometries and HBM sizes and refine (or plumb in the
+# actual free-HBM budget) rather than trusting this proxy.
+_KV_HEAD_TILE_MAX_WORKING_SET = 32 * 32 * 4096 * 128  # granite q=4096 / 32 blocks
 
 
 def _attn_tile_config_filename(
@@ -1183,14 +1180,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
         )
 
-    def _resolve_tile_counts(self, block_size: int, padded_query_len: int) -> tuple[int, int]:
+    def _tiled_working_set(self, num_blocks: int, block_size: int, padded_query_len: int) -> int:
+        """score/prob tile element count summed over the unrolled loop; see
+        _KV_HEAD_TILE_MAX_WORKING_SET."""
+        return num_blocks * self.num_heads * padded_query_len * block_size
+
+    def _resolve_tile_counts(
+        self, block_size: int, padded_query_len: int, num_blocks: int
+    ) -> tuple[int, int]:
         """(tile_kv_heads, tile_q_heads): explicit overrides, else tuned config.
 
-        `tile_kv_heads` is gated to the window
-        [KV_HEAD_TILE_THRESHOLD, KV_HEAD_TILE_MAX_QUERY_LEN]: below the lower
-        bound tiling is measured harmful (decode/short prefill), above the upper
-        bound the both-pages hoist + tiled transients OOM the card (measured at
-        query_len=8192). Outside the window kv_head tiling is forced off.
+        kv_head tiling is forced off below KV_HEAD_TILE_THRESHOLD (harmful at
+        short prefill) and above _KV_HEAD_TILE_MAX_WORKING_SET (OOM guard).
         """
         if self._tile_kv_heads_override is not None and self._tile_q_heads_override is not None:
             kv_heads, q_heads = self._tile_kv_heads_override, self._tile_q_heads_override
@@ -1208,7 +1209,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 if self._tile_q_heads_override is not None
                 else cfg["tile_q_heads"]
             )
-        if not (KV_HEAD_TILE_THRESHOLD <= padded_query_len <= KV_HEAD_TILE_MAX_QUERY_LEN):
+        below_threshold = padded_query_len < KV_HEAD_TILE_THRESHOLD
+        over_budget = (
+            self._tiled_working_set(num_blocks, block_size, padded_query_len)
+            > _KV_HEAD_TILE_MAX_WORKING_SET
+        )
+        if below_threshold or over_budget:
             kv_heads = 1
         return kv_heads, q_heads
 
@@ -1222,9 +1228,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     ):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
-        # Tile counts vary with block_size (config is shape-keyed) and
-        # padded_query_len (the kv_head threshold), so they are part of the key.
-        tile_kv_heads, tile_q_heads = self._resolve_tile_counts(block_size, padded_query_len)
+        # Tile counts vary with block_size, padded_query_len, and num_blocks (the
+        # gates), all already in the key.
+        tile_kv_heads, tile_q_heads = self._resolve_tile_counts(
+            block_size, padded_query_len, num_blocks
+        )
         key = (num_blocks, padded_query_len, tile_kv_heads, tile_q_heads, store_mode, store_len)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
@@ -1512,7 +1520,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             # Run attention on target device
             tile_kv_heads, tile_q_heads = self._resolve_tile_counts(
-                block_size, aligned_max_query_len
+                block_size, aligned_max_query_len, len(active_bs)
             )
             if tile_kv_heads > 1 or tile_q_heads > 1:
                 # Name the kernel inputs so the head-dim tile hints can bind
