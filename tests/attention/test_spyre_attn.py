@@ -863,6 +863,50 @@ def test_spyre_attn_soft_cap(
 @pytest.mark.parametrize(
     "seq_lens",
     [
+        # Chunked prefill: query_len > 1 over a non-empty prefix (context_len > 0).
+        # context_len on a block boundary vs. mid-block hits different boundary tiles.
+        pytest.param([(64, 256)], id="chunk_on_block_boundary(ctx=192)"),
+        pytest.param([(64, 200)], id="chunk_mid_block(ctx=136)"),
+        # Chunk not a multiple of QUERY_CHUNK_SIZE (32).
+        pytest.param([(48, 300)], id="unaligned_chunk(ctx=252)"),
+        pytest.param([(64, 256), (1, 256)], id="batch_chunk+decode"),
+    ],
+)
+def test_spyre_attn_chunked_prefill(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Chunked prefill: multi-token query attending over a pre-existing context."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
         pytest.param([(1, 256)], id="decode(q=1,kv=256)"),
         pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
     ],
