@@ -116,7 +116,7 @@ def _attn_tile_config_filename(
     )
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _get_attn_tile_config(
     head_size: int,
     num_kv_heads: int,
@@ -131,9 +131,7 @@ def _get_attn_tile_config(
     divisibility); a value that does not is dropped back to 1 with a warning.
     """
     default = {"tile_kv_heads": 1, "tile_q_heads": 1}
-    fname = _attn_tile_config_filename(
-        head_size, num_kv_heads, num_queries_per_kv, block_size
-    )
+    fname = _attn_tile_config_filename(head_size, num_kv_heads, num_queries_per_kv, block_size)
     path = os.path.join(_TILE_CONFIG_DIR, fname)
     if not os.path.exists(path):
         logger.debug_once(f"No attention tile config at {path}; tiling disabled")
@@ -145,8 +143,11 @@ def _get_attn_tile_config(
         val = int(cfg.get(key, 1))
         if val < 1 or axis % val != 0:
             logger.warning(
-                f"Ignoring {key}={val} from {path}: must be >=1 and divide "
-                f"{axis} evenly; disabling that axis"
+                "Ignoring %s=%s from %s: must be >=1 and divide %s evenly; disabling that axis",
+                key,
+                val,
+                path,
+                axis,
             )
             return 1
         return val
@@ -288,6 +289,7 @@ class _TileHints:
             yield
             return
         hint = self._spyre_hint
+        assert hint is not None
         tiles = self._tiles
         if len(tiles) == 1:
             (n0, c0) = tiles[0]
@@ -295,9 +297,8 @@ class _TileHints:
                 yield
         else:
             (n0, c0), (n1, c1) = tiles[0], tiles[1]
-            with hint(num_tiles_per_dim={n0: c0}):
-                with hint(num_tiles_per_dim={n1: c1}):
-                    yield
+            with hint(num_tiles_per_dim={n0: c0}), hint(num_tiles_per_dim={n1: c1}):
+                yield
 
     @contextlib.contextmanager
     def named(self, *names: str):
@@ -305,6 +306,7 @@ class _TileHints:
         if not self.active:
             yield
             return
+        assert self._spyre_hint is not None
         with self._spyre_hint(named_dims=list(names)):
             yield
 
@@ -1190,10 +1192,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         bound the both-pages hoist + tiled transients OOM the card (measured at
         query_len=8192). Outside the window kv_head tiling is forced off.
         """
-        if (
-            self._tile_kv_heads_override is not None
-            and self._tile_q_heads_override is not None
-        ):
+        if self._tile_kv_heads_override is not None and self._tile_q_heads_override is not None:
             kv_heads, q_heads = self._tile_kv_heads_override, self._tile_q_heads_override
         else:
             cfg = _get_attn_tile_config(

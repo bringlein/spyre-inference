@@ -161,7 +161,9 @@ def _build_inputs(
             v_pages_cpu[blk][off] = v_s[token_idx - historical_len]
             slot_mapping.append(blk * block_size + off)
         refs.append(
-            _ref_attn(q_s, k_pages_cpu, v_pages_cpu, query_len, kv_len, block_table_s, block_size, scale)
+            _ref_attn(
+                q_s, k_pages_cpu, v_pages_cpu, query_len, kv_len, block_table_s, block_size, scale
+            )
         )
         queries.append(q_s)
         keys.append(k_s)
@@ -463,7 +465,9 @@ def _verify_residency(
     # coarse_tile_read_copy_* of arg0/arg4 (the page args) or clones of the
     # gathered page buffers.
     page_hbm = [r for r in hbm if "read_copy" in r[0] and ("arg" in r[0] or "buf" in r[0])]
-    transient_lx = [r for r in lx if r[1] in ("mul", "add", "sum", "div", "sub", "exp", "maximum", "amax")]
+    transient_lx = [
+        r for r in lx if r[1] in ("mul", "add", "sum", "div", "sub", "exp", "maximum", "amax")
+    ]
 
     print(
         f"\n[residency] kv_head={tile_kv_heads} qpk={tile_q_heads}: "
@@ -661,8 +665,7 @@ def main():
     tile_q_heads = args.tile_q_heads
     if num_queries_per_kv % tile_q_heads != 0:
         raise SystemExit(
-            f"--tile-q-heads={tile_q_heads} must divide "
-            f"num_queries_per_kv={num_queries_per_kv}"
+            f"--tile-q-heads={tile_q_heads} must divide num_queries_per_kv={num_queries_per_kv}"
         )
 
     candidates = (
@@ -748,7 +751,10 @@ def main():
 
     for tile_kv_heads in candidates:
         if args.num_kv_heads % tile_kv_heads != 0:
-            print(f"skip tile_kv_heads={tile_kv_heads} (does not divide num_kv_heads={args.num_kv_heads})")
+            print(
+                f"skip tile_kv_heads={tile_kv_heads} "
+                f"(does not divide num_kv_heads={args.num_kv_heads})"
+            )
             continue
         # The backend clamps counts that leave a per-tile extent < 2 (see
         # _clamp_tile_count), so timing them would record a count that never runs.
@@ -760,7 +766,12 @@ def main():
         # profiled iterations so the per-length kernel is compiled once (during
         # the gate/warmup) and its compile cost stays out of the ranked metric.
         impl = _make_impl(
-            inputs, tile_kv_heads, tile_q_heads, args.head_size, args.num_query_heads, args.num_kv_heads
+            inputs,
+            tile_kv_heads,
+            tile_q_heads,
+            args.head_size,
+            args.num_query_heads,
+            args.num_kv_heads,
         )
 
         # Correctness gate: the tiled output runs the same fp16 device math as the
@@ -800,8 +811,10 @@ def main():
         total_us, total_mem_us = _device_times_us(prof)
         metric = total_us / args.iterations
         mem_us = total_mem_us / args.iterations
-        table = prof.key_averages().table(sort_by="cuda_time_total", row_limit=20).replace(
-            "CUDA", "AIU"
+        table = (
+            prof.key_averages()
+            .table(sort_by="cuda_time_total", row_limit=20)
+            .replace("CUDA", "AIU")
         )
         mem_share = (mem_us / metric * 100.0) if metric else 0.0
         print(
@@ -856,9 +869,7 @@ def main():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(os.path.dirname(__file__), "..", "tuning_runs")
     os.makedirs(run_dir, exist_ok=True)
-    run_path = os.path.join(
-        run_dir, f"tune_attn_{fname.replace('.json', '')}_{ts}.json"
-    )
+    run_path = os.path.join(run_dir, f"tune_attn_{fname.replace('.json', '')}_{ts}.json")
     with open(run_path, "w") as f:
         json.dump(
             {
