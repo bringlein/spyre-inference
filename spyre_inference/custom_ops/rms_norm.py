@@ -14,11 +14,8 @@
 
 """Spyre OOT replacement for RMSNorm.
 
-Spyre constraints:
-    - No dtype promotion to float32 (not yet supported in torch-spyre)
-
-References:
-    - Upstream RMSNorm: vllm/model_executor/layers/layernorm.py
+The fp16->fp32 upcast is correct only through torch-spyre's compile-time EA
+propagation (PR #2927), broken in eager. Hence force compiling here.
 """
 
 import torch
@@ -27,45 +24,35 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.models.transformers.fusers.rms_norm import TPAwareRMSNorm
 
+from .lazy_compile import CompileOutermost, compile_when_outermost
+
 logger = init_logger(__name__)
 
 
 @RMSNorm.register_oot(name="RMSNorm")
-class SpyreRMSNorm(RMSNorm):
+class SpyreRMSNorm(CompileOutermost, RMSNorm):
     """Out-of-tree (OOT) RMSNorm implementation for IBM's Spyre."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        # With fullgraph compile enabled, forward_native is compiled anyway.
+        self._forward = self.forward_native
+        if not torch.compiler.is_dynamo_compiling():
+            self._forward = torch.compile(self.forward_native, dynamic=False)
 
         logger.warning_once(
             "SpyreRMSNorm: no dtype promotion is performed, "
             "expect numerical differences to upstream vLLM."
         )
 
+    @compile_when_outermost
     def forward_oot(
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """RMSNorm kernel for Spyre."""
-
-        if self.variance_size_override is not None:
-            raise NotImplementedError("TODO: variance_size_override not yet implemented")
-
-        if residual is not None:
-            x = x + residual
-            residual = x
-
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-
-        x = x * torch.rsqrt(variance + self.variance_epsilon)
-
-        if self.has_weight:
-            x = x * self.weight
-        if residual is None:
-            return x
-        else:
-            return x, residual
+        return self._forward(x, residual)
 
 
 # The norm fuser instantiates TPAwareRMSNorm and OOT dispatch keys on the concrete class

@@ -119,7 +119,7 @@ endif
 RESULTS_DIR ?= .
 
 .PHONY: help test tests run-one aiu-setup perf-tests coverage print-test-type \
-        test-smoke test-attention test-distributed \
+        test-smoke test-attention test-attention-shard test-distributed \
         test-upstream test-upstream-distributed test-upstream-model \
         tests-single-card tests-multi-card
 
@@ -177,8 +177,28 @@ test-smoke: ## Run the smoke marker combo (non-distributed, non-upstream, non-at
 test-compile: ## Run the torch.compile marker combo (its own job; slow).
 	$(MAKE) run-one MARK_OVERRIDE='compile and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
 
-test-attention: ## Run the decoder-attention marker combo (attention minus the encoder split).
+test-attention: ## Run the decoder-attention marker combo (attention minus the encoder split), one process.
 	$(MAKE) run-one MARK_OVERRIDE='attention and not encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
+
+# Decoder attention is sharded across parallel CI jobs: the compiled
+# (STOCK on device) cases dominate runtime and grow HBM within a process, so
+# each shard runs as its own process (own card in CI, sequential locally) to
+# bound per-process growth and cut wall-clock to the slowest shard. The plugin
+# owns the partition (--attn-shards, weighted-balanced); this only threads the
+# knobs through. ATTN_SHARDS is the single source of truth for the count.
+ATTN_SHARDS ?= 7
+ATTN_SHARD_ID ?= 0
+test-attention-shard: ## Run one decoder-attention shard (ATTN_SHARDS=N ATTN_SHARD_ID=i).
+	$(MAKE) run-one \
+	  MARK_OVERRIDE='attention and not encoder_attention and not (distributed or upstream)' \
+	  PYTEST_ARGS='$(PYTEST_ARGS) --attn-shards=$(ATTN_SHARDS) --attn-shard-id=$(ATTN_SHARD_ID)' \
+	  JUNIT_XML=$(JUNIT_XML)
+
+# CI runs one matrix job per shard as `test-attention-shard-<i>`, so each job's
+# JUnit artifact name (junit-<target>.xml) is unique; the pattern maps <i> to
+# ATTN_SHARD_ID. ATTN_SHARDS (the total) comes from its default above.
+test-attention-shard-%:
+	$(MAKE) test-attention-shard ATTN_SHARD_ID=$* JUNIT_XML=$(JUNIT_XML)
 
 test-encoder-attention: ## Run the encoder-attention marker combo (its own job).
 	$(MAKE) run-one MARK_OVERRIDE='encoder_attention and not (distributed or upstream)' JUNIT_XML=$(JUNIT_XML)
@@ -202,7 +222,9 @@ tests-single-card: ## Run the non-distributed marker combos (smoke/compile/atten
 	rc=0; \
 	mkdir -p "$(RESULTS_DIR)/junit-test-smoke" && $(MAKE) test-smoke JUNIT_XML="$(RESULTS_DIR)/junit-test-smoke/junit-test-smoke.xml" || rc=1; \
 	mkdir -p "$(RESULTS_DIR)/junit-test-compile" && $(MAKE) test-compile JUNIT_XML="$(RESULTS_DIR)/junit-test-compile/junit-test-compile.xml" || rc=1; \
-	mkdir -p "$(RESULTS_DIR)/junit-test-attention" && $(MAKE) test-attention JUNIT_XML="$(RESULTS_DIR)/junit-test-attention/junit-test-attention.xml" || rc=1; \
+	for i in $$(seq 0 $$(( $(ATTN_SHARDS) - 1 ))); do \
+	  mkdir -p "$(RESULTS_DIR)/junit-test-attention-shard-$$i" && $(MAKE) test-attention-shard ATTN_SHARD_ID=$$i JUNIT_XML="$(RESULTS_DIR)/junit-test-attention-shard-$$i/junit-test-attention-shard-$$i.xml" || rc=1; \
+	done; \
 	mkdir -p "$(RESULTS_DIR)/junit-test-encoder-attention" && $(MAKE) test-encoder-attention JUNIT_XML="$(RESULTS_DIR)/junit-test-encoder-attention/junit-test-encoder-attention.xml" || rc=1; \
 	mkdir -p "$(RESULTS_DIR)/junit-test-upstream" && $(MAKE) test-upstream JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream/junit-test-upstream.xml" || rc=1; \
 	mkdir -p "$(RESULTS_DIR)/junit-test-upstream-model" && $(MAKE) test-upstream-model JUNIT_XML="$(RESULTS_DIR)/junit-test-upstream-model/junit-test-upstream-model.xml" || rc=1; \

@@ -511,6 +511,19 @@ def pytest_addoption(parser):
         help="Collect upstream vLLM tests even when the -m expression doesn't name the "
         "`upstream` marker (cloning vLLM if it isn't cached yet).",
     )
+    group = parser.getgroup("spyre-attention-shard")
+    group.addoption(
+        "--attn-shards",
+        type=int,
+        default=0,
+        help="Partition attention (non-encoder) tests into this many shards (0 = off).",
+    )
+    group.addoption(
+        "--attn-shard-id",
+        type=int,
+        default=0,
+        help="0-based index of the shard to run when --attn-shards is set.",
+    )
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -693,6 +706,57 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
     # Reorder tests so that tests with "uses_subprocess" marker run first
     _reorder_tests_by_name(items)
+
+    _apply_attention_shard(config, items)
+
+
+def _apply_attention_shard(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Keep only the attention items for this shard.
+
+    Every shard job computes the same partition and keeps its own slice, so no
+    cross-job coordination is needed.
+    """
+    num_shards = config.getoption("--attn-shards")
+    if not num_shards or num_shards <= 1:
+        return
+    shard_id = config.getoption("--attn-shard-id")
+    if not 0 <= shard_id < num_shards:
+        raise pytest.UsageError(f"--attn-shard-id must be in [0, {num_shards}); got {shard_id}")
+
+    attn_items = [
+        it
+        for it in items
+        if it.get_closest_marker("attention") and not it.get_closest_marker("encoder_attention")
+    ]
+    if not attn_items:
+        return
+
+    # Heavy = compiled kernel on device; those dominate wall time and HBM growth.
+    def _weight(item: pytest.Item) -> int:
+        nid = item.nodeid
+        return 8 if "device_spyre" in nid and "STOCK" in nid else 1
+
+    # Greedy longest-processing-time first over a stable order.
+    attn_items.sort(key=lambda it: it.nodeid)
+    attn_items.sort(key=_weight, reverse=True)
+    loads = [0] * num_shards
+    assigned: dict[str, int] = {}
+    for item in attn_items:
+        target = min(range(num_shards), key=lambda s: loads[s])
+        assigned[item.nodeid] = target
+        loads[target] += _weight(item)
+
+    attn_nodeids = {it.nodeid for it in attn_items}
+    kept, dropped = [], []
+    for item in items:
+        if item.nodeid in attn_nodeids and assigned[item.nodeid] != shard_id:
+            dropped.append(item)
+        else:
+            kept.append(item)
+
+    if dropped:
+        config.hook.pytest_deselected(items=dropped)
+        items[:] = kept
 
 
 def _reorder_tests_by_name(items: list[pytest.Item]) -> None:
