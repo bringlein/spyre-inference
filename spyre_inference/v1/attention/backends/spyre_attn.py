@@ -1549,15 +1549,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 # Name the kernel inputs so the head-dim tile hints can bind
                 # (PR #3674: naming only intermediates is insufficient).
                 _name_attn_inputs(
-                    q_dev,
+                    query_dev,
                     k_pages,
                     v_pages,
                     mask_tiles,
                     alibi_bias_tiles,
-                    num_kv_heads,
-                    num_queries_per_kv,
+                    self.num_kv_heads,
+                    self.num_queries_per_kv,
                     block_size,
-                    head_size,
+                    self.head_size,
                 )
             attn_fn = self._get_attn_fn(
                 len(active_bs),
