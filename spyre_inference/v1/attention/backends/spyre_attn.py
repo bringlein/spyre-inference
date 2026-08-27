@@ -90,14 +90,16 @@ _TILE_CONFIG_DIR = os.path.join(os.path.dirname(__file__), "configs")
 # (short prefill/decode regress ~5%). tile_q_heads (qpk) is not gated.
 KV_HEAD_TILE_THRESHOLD = 1024
 
-# Tiling co-allocates the per-block transients across the unrolled loop, OOMing
-# at extreme prefill. Ceiling = the tiled working set of the largest config that
-# ran (granite q=4096 / 32 blocks; q=8192 / 64 blocks OOM'd), estimated as the
-# score/prob element count summed over the loop (see _tiled_working_set) so it
-# scales with the head geometry in use, not a fixed query-length cutoff.
-# TODO: single-anchor estimate from one shape/card; re-measure the true OOM
-# boundary across head geometries and HBM sizes and refine (or plumb in the
-# actual free-HBM budget) rather than trusting this proxy.
+# OOM guard for the tiled path: the tiled kernel co-allocates every block's
+# transients in one HBM pool (one coarse-tile scope over the whole unrolled loop,
+# torch-spyre#3674) instead of freeing them per iteration, so the pool grows as
+# _tiled_working_set (~quadratic in prefill length) and OOMs the card — this, not
+# the ~0.03 GB page hoist, is the limit. Device-measured (granite 32q/8kv/d128/
+# blk128): q=4096 ws=5.4e8 -> 5.1 GB (fits); q=6144 ws=1.2e9 -> 13.2 GB (edge);
+# q=8192 ws=2.1e9 -> FlexAllocator OOM. The ceiling (= q=4096 ws) is the safe
+# line. CAVEAT: single-shape anchor measured with attention isolated (idle HBM);
+# a full run has less free HBM, so it's an upper bound. TODO: gate on real
+# free-HBM bytes instead of this element-count proxy.
 _KV_HEAD_TILE_MAX_WORKING_SET = 32 * 32 * 4096 * 128  # granite q=4096 / 32 blocks
 
 
