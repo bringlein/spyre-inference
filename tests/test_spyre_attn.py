@@ -329,6 +329,8 @@ def _run_spyre_attn_test(
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    tile_kv_heads: int | None = None,
+    tile_q_heads: int | None = None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # The compiled attention kernel targets the Spyre device. On CPU it routes
@@ -419,6 +421,8 @@ def _run_spyre_attn_test(
         sliding_window=sliding_window,
         kv_cache_dtype="auto",
         logits_soft_cap=soft_cap,
+        tile_kv_heads=tile_kv_heads,
+        tile_q_heads=tile_q_heads,
     )
 
     output = torch.empty_like(query).to(cache_device)
@@ -557,6 +561,42 @@ def test_spyre_attn_compiled_multi_seq(
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "tile_kv_heads",
+    [pytest.param(2, id="tile_kv_heads(2)"), pytest.param(4, id="tile_kv_heads(4)")],
+)
+def test_spyre_attn_kv_head_tiling(
+    default_vllm_config,
+    tile_kv_heads: int,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """kv_head coarse-tiling (query_len >= KV_HEAD_TILE_THRESHOLD) matches the
+    reference. kv_head is the only tileable axis: the query axes (qpk, lq) are
+    broadcast onto the K/V pages by the matmuls, so tiling them forces an
+    unresolvable slot-major->head-major page read-copy. kv_head is native to the
+    page, so with both pages hoisted the tiled read-copy is a clean slice.
+    """
+    _run_spyre_attn_test(
+        seq_lens=[(1024, 1024)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        tile_kv_heads=tile_kv_heads,
     )
 
 
@@ -1324,3 +1364,259 @@ def test_reshape_and_cache_scatter(
         import gc
 
         gc.collect()
+
+
+# ---------------------------------------------------------------------------
+# Ragged decode fast path (#612 bucketed decode + #468 jump-off-the-train)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # Uniform context: single (num_seqs, num_blocks) bucket => this is the
+        # #612 pad-to-bucket case (one batched bmm, no ragged drops).
+        pytest.param([(1, 256)] * 8, id="uniform(N=8)"),
+        pytest.param([(1, 256)] * 16, id="uniform(N=16)"),
+        pytest.param([(1, 384)] * 32, id="uniform(N=32)"),
+        # Skewed context: the flagship jump-off-the-train case — most seqs short,
+        # one long. Segments shrink the batch as the KV loop advances.
+        pytest.param([(1, 128)] * 15 + [(1, 2048)], id="skew(15x128+1x2048)"),
+        # Varied contexts spanning several block buckets.
+        pytest.param(
+            [(1, 128), (1, 300), (1, 130), (1, 900), (1, 256), (1, 512),
+             (1, 1500), (1, 128), (1, 700), (1, 256)],
+            id="varied(N=10)",
+        ),
+    ],
+)
+def test_spyre_attn_ragged_decode(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Decode-only batches (query_len==1, N>=8) run the ragged fast path and must
+    match the reference. Uniform contexts exercise #612's single bucket; skewed
+    and varied contexts exercise #468's segmented carry."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        # Below _MIN_DECODE_BATCH: falls back to the per-seq loop. (single_seq
+        # covers below-min decode; larger-N below-min decode shapes are not added
+        # because the per-seq reference itself drifts from the fp32 ref at the
+        # decode tolerance — orthogonal to the fallback gating this test checks.)
+        pytest.param([(1, 512)], id="single_seq(fallback)"),
+        # Prefill / mixed: not decode-only, so no schedule; per-seq loop.
+        pytest.param([(32, 256)] * 8, id="prefill(fallback)"),
+        pytest.param(
+            [(1, 256), (32, 256), (1, 256), (32, 256)] * 2, id="mixed(fallback)"
+        ),
+    ],
+)
+def test_spyre_attn_ragged_decode_fallback(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Batches that violate the fast-path preconditions must silently fall back
+    to the per-seq loop and still match the reference."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+def test_decode_schedule_arithmetic(default_vllm_config):
+    """Off-device unit test of the host group schedule: ascending sort, contiguous
+    group partition, each group's blocks_bucket covers its members, ascending
+    blocks across groups."""
+    from vllm.config import get_current_vllm_config
+
+    block_size = 128
+    kv_lens = [128, 300, 130, 900, 256, 512, 1500, 128, 700, 256]
+    n = len(kv_lens)
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32)
+    qsl = torch.tensor([0] + [1] * n, dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    max_blocks = (max(kv_lens) + block_size - 1) // block_size
+    block_table = torch.arange(n * max_blocks, dtype=torch.int32).reshape(n, max_blocks)
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.model_config.get_num_attention_heads = Mock(return_value=32)
+    vllm_config.model_config.get_num_kv_heads = Mock(return_value=8)
+    kv_cache_spec = AttentionSpec(
+        block_size=block_size, num_kv_heads=8, head_size=128, dtype=torch.float16
+    )
+    builder = SpyreAttentionMetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["l0"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    common = CommonAttentionMetadata(
+        query_start_loc=qsl,
+        query_start_loc_cpu=qsl,
+        seq_lens=seq_lens,
+        num_reqs=n,
+        num_actual_tokens=n,
+        max_query_len=1,
+        max_seq_len=max(kv_lens),
+        block_table_tensor=block_table,
+        slot_mapping=torch.zeros(n, dtype=torch.int64),
+        causal=True,
+    )
+    md = builder.build(0, common)
+    sched = md.decode_schedule
+    assert sched is not None
+
+    blocks_sorted = sched.blocks_sorted
+    assert blocks_sorted == sorted(blocks_sorted)  # ascending
+    # Groups partition the sorted slots contiguously; each group's blocks_bucket
+    # covers its members' block counts, and members shrink to the seqs bucket.
+    expected_slot = 0
+    covered = 0
+    for grp in sched.groups:
+        assert grp.slot_start == expected_slot
+        assert grp.num_members >= 1
+        assert grp.seqs_bucket >= grp.num_members
+        # Every member's block count snaps up to this group's blocks_bucket.
+        for j in range(grp.num_members):
+            assert blocks_sorted[grp.slot_start + j] <= grp.blocks_bucket
+        expected_slot += grp.num_members
+        covered += grp.num_members
+        prev_end = grp.blocks_bucket
+    assert covered == n
+    # Groups are ordered by ascending blocks_bucket.
+    buckets = [g.blocks_bucket for g in sched.groups]
+    assert buckets == sorted(buckets)
+
+
+@pytest.mark.parametrize(
+    "n_seqs,expect_schedule",
+    [
+        pytest.param(1, False, id="N=1_fallback"),
+        pytest.param(7, False, id="N=7_below_min_fallback"),
+        pytest.param(8, True, id="N=8_min_fastpath"),
+        pytest.param(16, True, id="N=16_fastpath"),
+    ],
+)
+def test_decode_schedule_gating(default_vllm_config, n_seqs, expect_schedule):
+    """Off-device: the builder produces a schedule iff num_seqs >= the min seqs
+    bucket (decode-only). Below it, decode_schedule is None (per-seq fallback)."""
+    from vllm.config import get_current_vllm_config
+
+    block_size = 128
+    kv_lens = [256] * n_seqs
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32)
+    qsl = torch.tensor([0] + [1] * n_seqs, dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    max_blocks = (max(kv_lens) + block_size - 1) // block_size
+    block_table = torch.arange(n_seqs * max_blocks, dtype=torch.int32).reshape(n_seqs, max_blocks)
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.model_config.get_num_attention_heads = Mock(return_value=32)
+    vllm_config.model_config.get_num_kv_heads = Mock(return_value=8)
+    builder = SpyreAttentionMetadataBuilder(
+        kv_cache_spec=AttentionSpec(
+            block_size=block_size, num_kv_heads=8, head_size=128, dtype=torch.float16
+        ),
+        layer_names=["l0"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    common = CommonAttentionMetadata(
+        query_start_loc=qsl,
+        query_start_loc_cpu=qsl,
+        seq_lens=seq_lens,
+        num_reqs=n_seqs,
+        num_actual_tokens=n_seqs,
+        max_query_len=1,
+        max_seq_len=max(kv_lens),
+        block_table_tensor=block_table,
+        slot_mapping=torch.zeros(n_seqs, dtype=torch.int64),
+        causal=True,
+    )
+    md = builder.build(0, common)
+    assert (md.decode_schedule is not None) == expect_schedule
+
+
+def test_decode_schedule_not_built_for_prefill(default_vllm_config):
+    """A batch with any query_len > 1 (prefill/mixed) gets no decode schedule."""
+    from vllm.config import get_current_vllm_config
+
+    block_size = 128
+    n = 8
+    query_lens = [32] * n  # prefill
+    kv_lens = [256] * n
+    seq_lens = torch.tensor(kv_lens, dtype=torch.int32)
+    qsl = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    max_blocks = (max(kv_lens) + block_size - 1) // block_size
+    block_table = torch.arange(n * max_blocks, dtype=torch.int32).reshape(n, max_blocks)
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.model_config.get_num_attention_heads = Mock(return_value=32)
+    vllm_config.model_config.get_num_kv_heads = Mock(return_value=8)
+    builder = SpyreAttentionMetadataBuilder(
+        kv_cache_spec=AttentionSpec(
+            block_size=block_size, num_kv_heads=8, head_size=128, dtype=torch.float16
+        ),
+        layer_names=["l0"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    common = CommonAttentionMetadata(
+        query_start_loc=qsl,
+        query_start_loc_cpu=qsl,
+        seq_lens=seq_lens,
+        num_reqs=n,
+        num_actual_tokens=sum(query_lens),
+        max_query_len=max(query_lens),
+        max_seq_len=max(kv_lens),
+        block_table_tensor=block_table,
+        slot_mapping=torch.zeros(sum(query_lens), dtype=torch.int64),
+        causal=True,
+    )
+    md = builder.build(0, common)
+    assert md.decode_schedule is None
+
