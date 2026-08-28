@@ -824,6 +824,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         from spyre_inference.v1.attention.backends.spyre_attn import (
             SpyrePagedKVCache,
             slot_major_kv_layout,
+            head_outermost_kv_layout,
+            _KV_HEAD_OUTERMOST,
         )
 
         # Iterate kv_cache_tensors (one entry per physical buffer)
@@ -842,24 +844,24 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
             # Host-allocated then transferred: only .to() takes a device_layout.
-            layout = slot_major_kv_layout(
-                num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
-            )
+            num_slots = num_blocks * spec.block_size
+            if _KV_HEAD_OUTERMOST:
+                layout = head_outermost_kv_layout(
+                    num_slots, spec.num_kv_heads, spec.head_size, torch.float16
+                )
+                page_shape = (spec.num_kv_heads, num_slots, spec.head_size)
+            else:
+                layout = slot_major_kv_layout(
+                    num_slots, spec.num_kv_heads, spec.head_size, torch.float16
+                )
+                page_shape = (num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
 
-            k_pages = torch.zeros(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
-            v_pages = torch.zeros(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+            k_pages = torch.zeros(*page_shape, dtype=torch.float16).to(
+                self._spyre_device, device_layout=layout
+            )  # ty: ignore[no-matching-overload]
+            v_pages = torch.zeros(*page_shape, dtype=torch.float16).to(
+                self._spyre_device, device_layout=layout
+            )  # ty: ignore[no-matching-overload]
 
             page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
             for layer_name in kv_cache_tensor.shared_by:
