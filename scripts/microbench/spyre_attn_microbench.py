@@ -13,29 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Micro-benchmark for the Spyre online-softmax attention kernel.
+"""Micro-benchmark for the Spyre attention kernel via the torch profiler. See README.
 
-Measures ``_online_softmax_attention`` (spyre_attn.py, labelled
-``@_record_function("spyre_attn::online_softmax")``) using the torch profiler as
-the instrument: Spyre has no CUDA-graph equivalent for excluding host overhead,
-so device time attributed to that span is the noise-free signal.
-
-Attribution (validated on hardware, see README): Kineto does NOT propagate
-device time to record_function parents (``self_device_time_total`` is 0 on every
-span) and AIUPTI populates no correlation ids, so device kernels are attributed
-to the innermost span whose window contains the kernel's *start*. Start-based,
-not containment-based: dispatch is async, so a kernel launched inside a span
-routinely completes after it closes.
-
-Two input modes, both lowering onto one measurement path:
-  * request-list  -- explicit per-request (query_len, seq_len) pairs
-  * cartesian grid -- batch_size x seqlen x decode_share x prompt_pattern
-
-Emits tab-separated CSV with the column names the plotting notebook expects.
-
-Run (Spyre pod):
-    SPYRE_ATTN_PROFILING=1 .venv/bin/python3 examples/microbench/spyre_attn_microbench.py \
-        --config examples/microbench/configs/granite33_8b_bs1.json
+    SPYRE_ATTN_PROFILING=1 .venv/bin/python3 scripts/microbench/spyre_attn_microbench.py \
+        --config scripts/microbench/configs/granite33_8b_bs64.json
 """
 
 import argparse
@@ -49,8 +30,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
-# _ATTN_PROFILING is read at import time in spyre_attn, so the env var must be
-# set before that module is imported anywhere.
+# _ATTN_PROFILING is read at import time in spyre_attn, so set it before import.
 os.environ["SPYRE_ATTN_PROFILING"] = "1"
 os.environ.setdefault("VLLM_PLUGINS", "spyre_inference")
 for _k, _v in (
@@ -78,12 +58,10 @@ SPANS = {
 }
 MEMORY_OP_MARKERS = ("memcpy", "memset", "restickify", "stickif")
 
-# Spyre requires float16 (platform.py raises otherwise), regardless of what the
-# model config declares.
+# Spyre requires float16 (platform.py raises otherwise).
 DTYPE = torch.float16
 
 
-# ── variant registry ───────────────────────────────────────────────────────
 VARIANT_REGISTRY: dict[str, dict] = {}
 
 
@@ -99,7 +77,6 @@ register_variant("online_softmax_compiled", "Implementation.SPYRE_ONLINE_SOFTMAX
 register_variant("online_softmax_eager", "Implementation.SPYRE_ONLINE_SOFTMAX_EAGER", False)
 
 
-# ── vLLM config context ───────────────────────────────────────────────────
 @contextlib.contextmanager
 def spyre_vllm_config(compiled: bool):
     """Establish a Spyre vLLM config context for standalone (non-pytest) use."""
@@ -122,7 +99,6 @@ def spyre_vllm_config(compiled: bool):
         yield
 
 
-# ── reference + metadata (inlined; no pytest dependency) ──────────────────
 def ref_attn(query, key_cache, value_cache, query_lens, kv_lens, block_tables, block_size, scale):
     """Full-causal varlen reference, no alibi/soft-cap/window (Granite shape)."""
     block_tables_np = block_tables.cpu().numpy()
@@ -147,7 +123,13 @@ def ref_attn(query, key_cache, value_cache, query_lens, kv_lens, block_tables, b
 
 
 def build_metadata(
-    num_query_heads, num_kv_heads, head_size, block_size, seq_lens, query_start_loc, block_table,
+    num_query_heads,
+    num_kv_heads,
+    head_size,
+    block_size,
+    seq_lens,
+    query_start_loc,
+    block_table,
     slot_mapping,
 ):
     """Drive the real SpyreAttentionMetadataBuilder."""
@@ -203,10 +185,17 @@ def _fused_qkv_kv_views(query, key, value, device):
     )
 
 
-# ── input builders ────────────────────────────────────────────────────────
 def build_inputs_from_requests(
-    query_lens, seq_lens, num_query_heads, num_kv_heads, head_size, block_size, num_blocks,
-    device, seed=0, kv_layout="plain",
+    query_lens,
+    seq_lens,
+    num_query_heads,
+    num_kv_heads,
+    head_size,
+    block_size,
+    num_blocks,
+    device,
+    seed=0,
+    kv_layout="plain",
 ):
     """Varlen multi-sequence inputs from explicit per-request lengths."""
     from vllm.utils.torch_utils import set_random_seed
@@ -264,34 +253,25 @@ def build_inputs_from_requests(
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
     attn_metadata = build_metadata(
-        num_query_heads, num_kv_heads, head_size, block_size,
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
         torch.tensor(seq_lens, dtype=torch.int32),
         torch.tensor([0] + list(query_lens), dtype=torch.int32).cumsum(0, dtype=torch.int32),
-        block_tables, slot_mapping,
+        block_tables,
+        slot_mapping,
     )
 
     cache_device = torch.device(device)
 
     def to_device(cache):
         # plain: host-populated cache, plain transfer. Matches
-        # tests/test_spyre_attn.py, which passes on device at these shapes.
-        #
-        # slot_major: the worker's layout (spyre_model_runner.py:742) pinned on an
-        # already-populated host tensor. Numerically WRONG: _reshape_and_cache
-        # views pages as [-1, H, D] and relies on the slot-outermost device layout
-        # (spyre_attn.py:967), so bytes laid out block-major host-side are
-        # reinterpreted in slot order. The worker survives this only because its
-        # host tensor is zeroed before transfer. 63667/524288 outliers at
-        # ql=128,kv=128 and a 17x apparent speedup from work that never happened.
-        #
-        # slot_major_devfill: ATTEMPT at production fidelity -- zeroed slot-major
-        # alloc plus on-device history fill via the kernel's own index_copy_.
-        # MEASURED WRONG, do not use for reported numbers: at q=1,kv=256 it gives
-        # 100.8us / max_diff 0.123 against plain's 3720.3us / 0.0022, i.e. the same
-        # skipped-work pathology as raw slot_major. Memory ops jump to 19.4% of the
-        # span (plain: 0.8%), so the index_copy_ source layout is the likely
-        # culprit -- convert() does not produce the slot-major layout the
-        # destination view expects. Unresolved.
+        # tests/attention/test_spyre_attn.py, correct at these shapes.
+        # slot_major / slot_major_devfill: numerically WRONG, kept only to
+        # reproduce the finding (see README). _reshape_and_cache views pages as
+        # [-1, H, D] and relies on the slot-outermost device layout, which
+        # convert() does not reproduce for a host tensor.
         if cache_device.type != "spyre" or kv_layout == "plain":
             return cache.to(cache_device)
         nb, bsz, h, d = cache.shape
@@ -303,7 +283,7 @@ def build_inputs_from_requests(
     k_pages, v_pages = to_device(k_pages_cpu), to_device(v_pages_cpu)
 
     if kv_layout == "slot_major_devfill" and cache_device.type == "spyre" and hist_slots:
-        # Same op the kernel uses (spyre_attn.py:130), on the same [-1, H, D] view.
+        # Same index_copy_ the kernel uses, on the same [-1, H, D] view.
         slots_dev = torch.tensor(hist_slots, dtype=torch.int64).to(cache_device)
         hk_dev = convert(torch.cat(hist_k), cache_device)
         hv_dev = convert(torch.cat(hist_v), cache_device)
@@ -331,14 +311,10 @@ def build_inputs_from_requests(
     }
 
 
-def grid_to_requests(batch_size, seqlen, decode_share, partial_prefill_share, prompt_pattern,
-                     block_size):
-    """Lower a Cartesian grid point onto explicit (query_lens, seq_lens).
-
-    Mirrors benchmark_paged_attention.build_attention_inputs: prompt_pattern is
-    cycled for per-request length variation, the batch is split decode /
-    partial-prefill / full-prefill, and partial-prefill context is block-aligned.
-    """
+def grid_to_requests(
+    batch_size, seqlen, decode_share, partial_prefill_share, prompt_pattern, block_size
+):
+    """Lower a Cartesian grid point onto explicit (query_lens, seq_lens)."""
     cycle = itertools.cycle(prompt_pattern)
     init_lens = [max(1, int(np.ceil(seqlen * next(cycle)))) for _ in range(batch_size)]
 
@@ -368,12 +344,9 @@ def grid_to_requests(batch_size, seqlen, decode_share, partial_prefill_share, pr
     return query_lens, seq_lens
 
 
-# ── profiler plumbing ─────────────────────────────────────────────────────
 def assert_device_profiler_active(prof):
     """Abort unless the probe profile carries real Spyre device events."""
-    total = sum(
-        getattr(e, "self_device_time_total", 0.0) or 0.0 for e in prof.events()
-    )
+    total = sum(getattr(e, "self_device_time_total", 0.0) or 0.0 for e in prof.events())
     if total <= 0.0:
         raise SystemExit(
             "No Spyre device events in the probe profile. The AIUPTI backend is "
@@ -395,14 +368,12 @@ def assert_span_present(prof, span):
 
 
 def span_device_times(prof, span=SPANS["online_softmax"]):
-    """Device time attributed to `span`, in microseconds.
+    """Device time (us) attributed to `span`, and its memory-op subtotal.
 
     Kineto does not propagate device time to record_function parents and AIUPTI
-    emits no correlation ids, so attribute each device kernel to the innermost
-    span containing its *start*. Start-based because dispatch is async: a kernel
-    launched inside the span often completes after the span closes.
-
-    Returns (total_us, memory_op_us).
+    emits no correlation ids, so attribute each kernel to the innermost span
+    containing its *start* (dispatch is async, so containment would drop kernels
+    that finish after the span closes).
     """
     events = list(prof.events())
     spans = sorted(
@@ -410,9 +381,8 @@ def span_device_times(prof, span=SPANS["online_softmax"]):
         key=lambda item: item[1].end - item[1].start,  # innermost first
     )
     outer = span == SPANS["forward"]
-    # Union of every window for this span. `spans` is sorted innermost-first, so
-    # taking the first match would pick the *narrowest* forward span and drop the
-    # kernels of any other.
+    # Union of every window for this span; spans is innermost-first, so the
+    # first match would pick the narrowest forward window and drop the rest.
     windows = [tr for n, tr in spans if n == span]
     total = mem = 0.0
     for e in events:
@@ -421,9 +391,8 @@ def span_device_times(prof, span=SPANS["online_softmax"]):
             continue
         start = e.time_range.start
         if outer:
-            # forward encloses reshape_and_cache and online_softmax, so
-            # innermost-wins would credit its kernels to the children. Take
-            # every kernel starting inside any forward window instead.
+            # forward encloses the leaf spans, so credit every kernel starting
+            # inside any forward window rather than to the innermost child.
             if any(w.start <= start <= w.end for w in windows):
                 total += dev
                 if any(m in e.name.lower() for m in MEMORY_OP_MARKERS):
@@ -445,7 +414,6 @@ def span_cpu_time_us(prof, span=SPANS["online_softmax"]):
     return float("nan")
 
 
-# ── measurement ───────────────────────────────────────────────────────────
 def make_forward(inputs, num_query_heads, num_kv_heads, head_size):
     from spyre_inference.v1.attention.backends.spyre_attn import (
         SpyreAttentionImpl,
@@ -458,9 +426,9 @@ def make_forward(inputs, num_query_heads, num_kv_heads, head_size):
         scale=inputs["scale"],
         num_kv_heads=num_kv_heads,
     )
-    # Allocate from the host query then transfer, as the test and production do:
-    # empty_like on an already-on-device tensor yields a layout the kernel's
-    # write does not match, and the readback is then garbage.
+    # Allocate from the host query then transfer, as test and production do:
+    # empty_like on an on-device tensor gives a layout the kernel's write does
+    # not match, and the readback is then garbage.
     output = torch.empty_like(inputs["query_cpu"]).to(inputs["cache_device"])
     kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
 
@@ -481,12 +449,10 @@ def make_forward(inputs, num_query_heads, num_kv_heads, head_size):
 
 
 def measure(run, iterations, span=SPANS["online_softmax"]):
-    """Profile `iterations` forwards as separate short windows.
+    """Profile each forward in its own short window.
 
-    One forward per profile() window: the AIUPTI backend has a hardcoded pool of
-    5 trace buffers and terminates capture when it fills (kineto_profiling.md
-    sec 4.5), so a single long window truncates the device timeline. Separate
-    windows also yield a real per-iteration distribution.
+    The AIUPTI backend has a fixed trace-buffer pool and stops capturing once
+    full (kineto_profiling.md §4.5), so one long window truncates the timeline.
     """
     dev_us, mem_us, cpu_us = [], [], []
     for _ in range(iterations):
@@ -512,8 +478,11 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
     num_blocks = max(cfg["num_blocks"], (max_kv + block_size - 1) // block_size)
 
     span = SPANS[cfg.get("span", "online_softmax")]
-    print(f"  {variant:26} bs={block_size:<4} {name:24} nreqs={len(query_lens)} "
-          f"q={sum(query_lens)} kv={max_kv}", flush=True)
+    print(
+        f"  {variant:26} bs={block_size:<4} {name:24} nreqs={len(query_lens)} "
+        f"q={sum(query_lens)} kv={max_kv}",
+        flush=True,
+    )
 
     row = {
         "capture_name": name,
@@ -553,8 +522,15 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
     inputs = None
     try:
         inputs = build_inputs_from_requests(
-            query_lens, seq_lens, num_q, num_kv, head_size, block_size,
-            num_blocks, cfg.get("device", "spyre"), seed=cfg.get("seed", 0),
+            query_lens,
+            seq_lens,
+            num_q,
+            num_kv,
+            head_size,
+            block_size,
+            num_blocks,
+            cfg.get("device", "spyre"),
+            seed=cfg.get("seed", 0),
             kv_layout=cfg.get("kv_layout", "plain"),
         )
         if inputs is None:
@@ -568,18 +544,12 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             run()  # first call: compile + populate metadata device mirrors
-            row["fallback_clean"] = not any(
-                "fallback" in str(w.message).lower() for w in caught
-            )
+            row["fallback_clean"] = not any("fallback" in str(w.message).lower() for w in caught)
 
-        # Correctness gate before timing. Same semantics as
-        # tests/test_spyre_attn.py: relative tolerance, a few fp16 stragglers
-        # tolerated (max_outliers=5 there).
-        #
-        # The reference reads the KV pages back off the device after the forward
-        # rather than using the host copy: under the production slot-major
-        # layout the on-device page contents are what the kernel actually read,
-        # and reshape_and_cache has written into them.
+        # Correctness gate before timing, same semantics as
+        # tests/attention/test_spyre_attn.py. The reference reads KV pages back
+        # off the device, not the host copy: under slot-major the on-device
+        # contents are what the kernel actually read.
         atol, rtol = cfg.get("atol", 0.3), cfg.get("rtol", 0.2)
         max_outliers = cfg.get("max_outliers", 5)
         got = output.to("cpu").float()
@@ -599,8 +569,11 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         row["num_outliers"] = n_outliers
         row["allclose_pass"] = n_outliers <= max_outliers
         if not row["allclose_pass"]:
-            print(f"    -> CORRECTNESS FAIL (max_diff={row['max_abs_diff']:.4g}, "
-                  f"outliers={n_outliers}/{diff.numel()})", flush=True)
+            print(
+                f"    -> CORRECTNESS FAIL (max_diff={row['max_abs_diff']:.4g}, "
+                f"outliers={n_outliers}/{diff.numel()})",
+                flush=True,
+            )
 
         for _ in range(cfg.get("warmup", 2)):
             run()
@@ -615,10 +588,13 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
                 100.0 * np.median(mem_us) / np.median(dev_us) if np.median(dev_us) else 0.0
             )
             row["cpu_time_ms"] = float(np.median(cpu_us)) / 1000.0
-            print(f"    -> {row['ms'] * 1000:.1f}us device "
-                  f"(min={row['min_ms'] * 1000:.1f}, max={row['max_ms'] * 1000:.1f}) "
-                  f"mem={row['memory_share_pct']:.1f}%  cpu={row['cpu_time_ms']:.2f}ms  "
-                  f"max_diff={row['max_abs_diff']:.3g}", flush=True)
+            print(
+                f"    -> {row['ms'] * 1000:.1f}us device "
+                f"(min={row['min_ms'] * 1000:.1f}, max={row['max_ms'] * 1000:.1f}) "
+                f"mem={row['memory_share_pct']:.1f}%  cpu={row['cpu_time_ms']:.2f}ms  "
+                f"max_diff={row['max_abs_diff']:.3g}",
+                flush=True,
+            )
         else:
             row["error"] = "no device time attributed to span"
             print("    -> no device time attributed", flush=True)
@@ -638,7 +614,6 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         gc.collect()
 
 
-# ── entry list construction ───────────────────────────────────────────────
 def entries_from_config(cfg):
     """Build the shape list from either request-list or grid mode."""
     entries = []
@@ -646,13 +621,15 @@ def entries_from_config(cfg):
     for e in cfg.get("capture_batches", []):
         query_lens = _expand(e, "query_lens")
         seq_lens = _expand(e, "seq_lens")
-        entries.append({
-            "name": e.get("name", f"nreqs{len(query_lens)}"),
-            "capture_type": e.get("capture_type") or _infer_type(query_lens),
-            "query_lens": query_lens,
-            "seq_lens": seq_lens,
-            "extra_cols": e.get("extra_cols", {}),
-        })
+        entries.append(
+            {
+                "name": e.get("name", f"nreqs{len(query_lens)}"),
+                "capture_type": e.get("capture_type") or _infer_type(query_lens),
+                "query_lens": query_lens,
+                "seq_lens": seq_lens,
+                "extra_cols": e.get("extra_cols", {}),
+            }
+        )
 
     grid = cfg.get("grid")
     if grid:
@@ -663,20 +640,22 @@ def entries_from_config(cfg):
                     for ds in grid["decode_shares"]:
                         pps = grid.get("partial_prefill_share", 0.0)
                         ql, sl = grid_to_requests(bs, seqlen, ds, pps, pattern, cfg["block_size"])
-                        entries.append({
-                            "name": f"grid_bs{bs}_sl{seqlen}_ds{ds}",
-                            "capture_type": _infer_type(ql),
-                            "query_lens": ql,
-                            "seq_lens": sl,
-                            "extra_cols": {
-                                "seqlen": seqlen,
-                                "decode_share": ds,
-                                "partial_prefill_share": pps,
-                                "prompt_pattern": str(pattern),
-                                "realistic_prompt_mode": len(pattern) > 1,
-                                "gqa_mode": cfg["num_query_heads"] != cfg["num_kv_heads"],
-                            },
-                        })
+                        entries.append(
+                            {
+                                "name": f"grid_bs{bs}_sl{seqlen}_ds{ds}",
+                                "capture_type": _infer_type(ql),
+                                "query_lens": ql,
+                                "seq_lens": sl,
+                                "extra_cols": {
+                                    "seqlen": seqlen,
+                                    "decode_share": ds,
+                                    "partial_prefill_share": pps,
+                                    "prompt_pattern": str(pattern),
+                                    "realistic_prompt_mode": len(pattern) > 1,
+                                    "gqa_mode": cfg["num_query_heads"] != cfg["num_kv_heads"],
+                                },
+                            }
+                        )
     return entries
 
 
@@ -700,7 +679,6 @@ def _infer_type(query_lens):
     return "mixed"
 
 
-# ── main ──────────────────────────────────────────────────────────────────
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", required=True)
@@ -709,16 +687,22 @@ def main():
     ap.add_argument("--iterations", type=int, default=None)
     ap.add_argument("--warmup", type=int, default=None)
     ap.add_argument("--device", default=None)
-    ap.add_argument("--kv-layout",
-                    choices=["plain", "slot_major", "slot_major_devfill"], default=None,
-                    help="KV page device layout. 'plain' (default) is correct for a "
-                         "host-populated cache. 'slot_major_devfill' matches the "
-                         "worker: zeroed slot-major alloc, history written on device. "
-                         "'slot_major' pins the worker layout on a host-populated "
-                         "cache and is numerically wrong; kept to reproduce that.")
-    ap.add_argument("--span", choices=sorted(SPANS), default=None,
-                    help="record_function scope to attribute device time to "
-                         "(default: online_softmax)")
+    ap.add_argument(
+        "--kv-layout",
+        choices=["plain", "slot_major", "slot_major_devfill"],
+        default=None,
+        help="KV page device layout. 'plain' (default) is correct for a "
+        "host-populated cache. 'slot_major_devfill' matches the "
+        "worker: zeroed slot-major alloc, history written on device. "
+        "'slot_major' pins the worker layout on a host-populated "
+        "cache and is numerically wrong; kept to reproduce that.",
+    )
+    ap.add_argument(
+        "--span",
+        choices=sorted(SPANS),
+        default=None,
+        help="record_function scope to attribute device time to (default: online_softmax)",
+    )
     ap.add_argument("--stop-on-failure", action="store_true")
     ap.add_argument("--no-output", action="store_true")
     ap.add_argument("--allow-empty-device-profile", action="store_true")
@@ -727,8 +711,11 @@ def main():
     with open(args.config) as f:
         cfg = json.load(f)
     for key, val in (
-        ("iterations", args.iterations), ("warmup", args.warmup), ("device", args.device),
-        ("span", args.span), ("kv_layout", args.kv_layout),
+        ("iterations", args.iterations),
+        ("warmup", args.warmup),
+        ("device", args.device),
+        ("span", args.span),
+        ("kv_layout", args.kv_layout),
     ):
         if val is not None:
             cfg[key] = val
@@ -758,9 +745,11 @@ def main():
 
     print(f"\nSpyre attention micro-benchmark  [{stamp}]")
     print(f"  model      : {cfg.get('model', 'n/a')}")
-    print(f"  shape      : q_heads={cfg['num_query_heads']} kv_heads={cfg['num_kv_heads']} "
-          f"head_size={cfg['head_size']} "
-          f"block_size={cfg.get('block_sizes') or cfg['block_size']} dtype={DTYPE}")
+    print(
+        f"  shape      : q_heads={cfg['num_query_heads']} kv_heads={cfg['num_kv_heads']} "
+        f"head_size={cfg['head_size']} "
+        f"block_size={cfg.get('block_sizes') or cfg['block_size']} dtype={DTYPE}"
+    )
     print(f"  span       : {SPANS[cfg.get('span', 'online_softmax')]}")
     print(f"  variants   : {variants}")
     print(f"  shapes     : {len(entries)}")
@@ -784,8 +773,14 @@ def main():
         # Startup guard: probe on the smallest shape.
         probe = entries[0]
         probe_inputs = build_inputs_from_requests(
-            probe["query_lens"], probe["seq_lens"], cfg["num_query_heads"], cfg["num_kv_heads"],
-            cfg["head_size"], cfg["block_size"], cfg["num_blocks"], cfg["device"],
+            probe["query_lens"],
+            probe["seq_lens"],
+            cfg["num_query_heads"],
+            cfg["num_kv_heads"],
+            cfg["head_size"],
+            cfg["block_size"],
+            cfg["num_blocks"],
+            cfg["device"],
         )
         probe_run, _ = make_forward(
             probe_inputs, cfg["num_query_heads"], cfg["num_kv_heads"], cfg["head_size"]
@@ -798,8 +793,7 @@ def main():
         if not args.allow_empty_device_profile:
             assert_device_profiler_active(prof)
         total, _ = span_device_times(prof, sel_span)
-        print(f"  [guard] profiler active; '{sel_span}' device time = {total:.1f}us\n",
-              flush=True)
+        print(f"  [guard] profiler active; '{sel_span}' device time = {total:.1f}us\n", flush=True)
         del probe_inputs, probe_run
         gc.collect()
 
@@ -815,8 +809,10 @@ def main():
         df.to_csv(out_dir / "spyre_attn_microbench_final.csv", sep="\t", index=False)
         print(f"\nDone. {len(df)} measurements -> {out_dir}")
     ok = df[df["ms"].notna()]
-    print(f"  measured {len(ok)}/{len(df)}; correctness pass "
-          f"{int(df['allclose_pass'].sum())}/{len(df)}")
+    print(
+        f"  measured {len(ok)}/{len(df)}; correctness pass "
+        f"{int(df['allclose_pass'].sum())}/{len(df)}"
+    )
 
     sys.stdout.flush()
     sys.stderr.flush()

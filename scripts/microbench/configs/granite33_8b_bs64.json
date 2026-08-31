@@ -1,5 +1,5 @@
 {
-  "run_label": "granite33_8b_bs1",
+  "run_label": "granite33_8b_bs64",
   "model": "granite-3.3-8b-instruct",
   "num_query_heads": 32,
   "num_kv_heads": 8,
