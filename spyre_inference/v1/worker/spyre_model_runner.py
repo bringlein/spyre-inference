@@ -52,8 +52,6 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.model_loader.utils import get_model_architecture
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
-from vllm.model_executor.models.utils import PPMissingLayer
-from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -61,34 +59,17 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     PoolerOutput,
 )
-from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference import envs
-from spyre_inference.custom_ops.bert_head_pad import install_bert_head_pad
-from spyre_inference.custom_ops.conv import SpyreConv2d
-from spyre_inference.custom_ops.head_pad import (
-    fix_padded_attention_scale,
-    fix_padded_qk_norm_eps,
-    fix_padded_rope,
-    install_head_pad_weight_loader,
-    install_padded_head_dim,
-    verify_padded_head_dim,
-    verify_padded_qk_norm_weights,
-)
-from spyre_inference.custom_ops.mlp_pad import (
-    install_mlp_pad_weight_loader,
-    verify_padded_intermediate_size,
-)
 from spyre_inference.custom_ops.utils import convert, convert_tensor_tree
 from spyre_inference.models import check_spyre_model
 from spyre_inference.models._vision_encoder import SpyreVisionEncoderMixin
 from spyre_inference.models.mistral import reset_llama4_scale_cache
 from spyre_inference.models.roberta import offset_host_positions, roberta_position_delta
 from spyre_inference.multimodal import apply_multimodal_patches
-from spyre_inference.multimodal.utils import blocks_marked_compilable
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
@@ -96,9 +77,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     allocate_staging_buffers,
 )
+from spyre_inference.v1.attention.warmup import record_attention_graphs
 from spyre_inference.v1.pool import (
-    SpyreAllPool,
-    SpyreTokenPooler,
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
     select_rows,
@@ -107,18 +87,16 @@ from spyre_inference.v1.pool.encoder_grid import (
     pool_rows_for,
     unpad_encoder_grid,
 )
-from spyre_inference.v1.pool.spyre_pooler import (
-    SpyreClassifierLinear,
-    SpyreEmbeddingPoolerHead,
-    SpyreMeanPool,
-    SpyreRobertaClassificationHead,
-    _iter_modules,
-    _mean_pool_grid_reduce,
-    _mean_pool_row_mask_mul,
-)
+from spyre_inference.v1.pool.warmup import dummy_pooling_metadata, warm_pooler_row_widths
 from spyre_inference.v1.sample.sampler import greedy_sample
 from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
+from spyre_inference.v1.worker.compile_granularity import (
+    block_sharing_defeated_by,
+    compile_blocks,
+    compile_granularity,
+    repeated_block_lists,
+)
 from spyre_inference.v1.worker.encoder_grid import (
     EncoderDispatchStats,
     encoder_pad_token_id,
@@ -127,6 +105,11 @@ from spyre_inference.v1.worker.encoder_grid import (
 from spyre_inference.v1.worker.kv_cache_setup import (
     allocate_spyre_kv_caches,
     split_attn_groups_by_window,
+)
+from spyre_inference.v1.worker.model_load import (
+    fix_padded_model,
+    install_pad_loaders,
+    move_model_to_spyre,
 )
 from spyre_inference.v1.worker.spyre_encoder_graph import SpyreEncoderGraphManager
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -312,94 +295,6 @@ class SpyreCpuGpuBuffer(CpuGpuBuffer):
         # If the copy_to_cpu also becomes required, override it here with
         # spyre-specific aspects.
         raise NotImplementedError("SpyreCpuGpuBuffer.copy_to_cpu is not implemented")
-
-
-SPYRE_COMPILE_GRANULARITIES = ("block", "model")
-
-
-def _compile_granularity() -> str:
-    granularity = envs.SPYRE_COMPILE_GRANULARITY
-    if granularity not in SPYRE_COMPILE_GRANULARITIES:
-        raise ValueError(
-            f"Unsupported SPYRE_COMPILE_GRANULARITY={granularity!r}. "
-            f"Expected one of {SPYRE_COMPILE_GRANULARITIES}."
-        )
-    return granularity
-
-
-def _block_sharing_defeated_by() -> str | None:
-    """Sharing needs vLLM to hoist layer names out of the graph; report when it cannot."""
-    try:
-        from vllm.utils.torch_utils import _USE_LAYERNAME
-    except ImportError:
-        return None
-    if not _USE_LAYERNAME:
-        return (
-            "vLLM is not hoisting per-layer attention names (needs torch >= 2.11 and "
-            "VLLM_USE_LAYERNAME=1), so each block compiles separately"
-        )
-    return None
-
-
-def _is_decoder_attention_like(module: nn.Module) -> bool:
-    """Return whether a module participates in decoder KV-cache attention.
-
-    Native vLLM models own an ``Attention`` directly. The Transformers backend
-    instead retains an HF dispatcher with a ``layer_idx`` and the text config's
-    ``_attn_implementation`` set to ``vllm``. Those are the interface
-    contract, unlike the module's class name, and do not match vision encoders.
-    The backend also attaches its vLLM layer as ``.attn``, but for an MLA model that
-    is an ``MLAAttention``, which is not an ``Attention``, so the check stays.
-    """
-    if isinstance(module, Attention):
-        return True
-    # Vision encoders retain their HF attention implementation (for example,
-    # ``sdpa``). Only text-decoder wrappers are configured to dispatch through
-    # vLLM's KV-cache attention implementation. Transformers may prefix the
-    # implementation with ``paged|`` when it enables its paged-cache wrapper.
-    # Vision towers compile through ``SpyreVisionEncoderMixin`` instead, per encoder
-    # budget, not through ``_compile_blocks``.
-    implementation = getattr(getattr(module, "config", None), "_attn_implementation", "") or ""
-    return isinstance(getattr(module, "layer_idx", None), int) and "vllm" in implementation.split(
-        "|"
-    )
-
-
-_VISION_TOWER_NAME_PARTS = frozenset(("vision_encoder", "vision_tower", "vision_model", "visual"))
-
-
-def _is_vision_tower_path(qualname: str) -> bool:
-    """True for ``vision_encoder.transformer.layers`` and the HF / Qwen-VL spellings."""
-    return any(part in _VISION_TOWER_NAME_PARTS for part in qualname.split("."))
-
-
-def _repeated_block_lists(model: nn.Module) -> list[tuple[nn.ModuleList, bool]]:
-    """Each compilable block list with whether a multimodal patch marked it."""
-    block_lists: list[tuple[nn.ModuleList, bool]] = []
-    for qualname, module in model.named_modules():
-        if not isinstance(module, nn.ModuleList):
-            continue
-        blocks = [b for b in module if not isinstance(b, PPMissingLayer)]
-        if not blocks:
-            continue
-        # A multimodal patch marks the blocks whose body it made traceable; reading the
-        # mark off the blocks keeps an outer list that merely nests a marked tower out.
-        if blocks_marked_compilable(blocks):
-            block_lists.append((module, True))
-            continue
-        # Every other tower stays eager: its block body builds constants on the host,
-        # which have no device layout. Decoder lists are never named these.
-        if _is_vision_tower_path(qualname):
-            continue
-        # nn.Module.modules() yields the module itself, so a list of bare Attention
-        # layers (Zamba2's dpa_list) would match and "compile" one opaque call per entry.
-        if any(_is_decoder_attention_like(b) for b in blocks):
-            continue
-        # Hybrid Mamba+attention stacks (Granite 4.0, Jamba) mix classes in one list;
-        # each class shares a forward code object, so compiles scale per class, not depth.
-        if any(_is_decoder_attention_like(m) for b in blocks for m in b.modules()):
-            block_lists.append((module, False))
-    return block_lists
 
 
 class _SpyreModelWrapper:
@@ -716,14 +611,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.load_config.load_format = "dummy"
         model_loader = get_model_loader(self.load_config)
 
-        # Pad attention weights (q/k/v/o, and QK-norm) to the stick-aligned head_dim
-        # as they stream in, when the platform overrode head_dim (e.g. head_size=64).
-        # Must run before load_model builds+loads the (now 128-wide) params.
-        text_config = self.model_config.hf_text_config
-        install_padded_head_dim(self.model_config)
-        install_bert_head_pad(self.model_config)
-        install_head_pad_weight_loader(model_loader, text_config, self.model_config)
-        install_mlp_pad_weight_loader(model_loader, text_config, self.model_config)
+        install_pad_loaders(model_loader, self.model_config)
 
         # Load model on CPU
         self.model = model_loader.load_model(
@@ -742,30 +630,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
 
-        # Restore original RoPE frequencies and attention scale, and compensate
-        # QK-norm epsilon for the padded head_dim. All passes are scoped to the
-        # padded text backbone (see custom_ops.text_backbone).
-        verify_padded_head_dim(self.model, text_config, self.model_config)
-        verify_padded_qk_norm_weights(self.model, text_config, self.model_config)
-        verify_padded_intermediate_size(self.model, text_config, self.model_config)
-        fix_padded_rope(self.model, text_config, self.model_config)
-        fix_padded_attention_scale(self.model, text_config, self.model_config)
-        fix_padded_qk_norm_eps(self.model, text_config, self.model_config)
-
-        # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
-        # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
-        # an nn.Module, but just the attention implementation.
-        Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
+        fix_padded_model(self.model, self.model_config)
 
         # Before any trace: resolved lazily inside the block graph, the scales become a
         # guard on their unset value and the first real prefill recompiles the block.
         self._resolve_kv_scales()
 
-        # Move layer weights to Spyre device.
-        self.model.to(device=self._spyre_device)
-        for module in self.model.modules():
-            if isinstance(module, SpyreConv2d):
-                module.process_weights_after_loading()
+        move_model_to_spyre(self.model, self._spyre_device)
 
         # CLS/LAST gather on Spyre. MEAN reduces each rectangle lane on Spyre and
         # falls back to the host elsewhere. FP32 linear heads stay on CPU.
@@ -886,7 +757,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Validated before the eager short-circuit so a typo is not silently ignored.
         # Per-block is the default: identical blocks share a ``forward`` code object,
         # so the backend compiles one block rather than a program that grows with depth.
-        granularity = _compile_granularity()
+        granularity = compile_granularity()
         self._compiled_tower_blocks = 0
 
         if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
@@ -896,7 +767,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         model_name = type(self.model).__name__
 
         if granularity == "block":
-            defeated_by = _block_sharing_defeated_by()
+            defeated_by = block_sharing_defeated_by()
             if defeated_by:
                 logger.warning(
                     "SPYRE_COMPILE_GRANULARITY=block will not share one artifact across "
@@ -931,32 +802,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logger.info("Wrapped %s as a single graph for Spyre.", model_name)
 
     def _compile_blocks(self) -> int:
-        # Only decoder blocks are returned: the count decides the whole-model fallback,
-        # which an opted-in tower must not pre-empt (it compiles beside either form).
-        num_blocks = num_tower = 0
-        # Models that re-register a slice of `layers` (e.g. gemma-4's self-/cross-decoder)
-        # alias blocks across lists; recompiling one is harmless but would double the count.
-        seen: set[int] = set()
-        for blocks, marked in _repeated_block_lists(cast(nn.Module, self.model)):
-            for block in blocks:
-                if isinstance(block, PPMissingLayer) or id(block) in seen:
-                    continue
-                seen.add(id(block))
-                # In place: rebinding blocks[i] to the returned OptimizedModule reparents
-                # the block under `_orig_mod`, renaming every parameter and breaking
-                # reload_weights and save_sharded_state.
-                block.compile(backend="inductor", fullgraph=True, dynamic=False)
-                # Identical blocks share one `forward` code object -- that is why this
-                # granularity shares a single artifact -- so this collapses to one
-                # registration per block *class*, which is the right granularity for
-                # the message too. A marked tower is watched like the decoder:
-                # `_warmup_multimodal_encoder` compiles it at every image-batch width.
-                compile_guard.watch(block, f"{type(block).__name__} (transformer block)")
-                if marked:
-                    num_tower += 1
-                else:
-                    num_blocks += 1
-        self._compiled_tower_blocks = num_tower
+        num_blocks, self._compiled_tower_blocks = compile_blocks(
+            repeated_block_lists(cast(nn.Module, self.model))
+        )
         return num_blocks
 
     def warming_up_model(self) -> None:
@@ -1204,34 +1052,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "_spyre_kv_caches is empty: initialize_kv_cache_tensors() must run first."
         )
 
-        # Every layer keeps its own kernel cache, so each is recorded separately;
-        # layers sharing a head configuration trace to the same graph and only
-        # the first pays a full Inductor compile.
-        static_ctx = self.compilation_config.static_forward_context
-        t0 = time.time()
-        total = 0
-        builders = self._attn_metadata_builders()
         with _set_spyre_compilation_settings(self.vllm_config):
-            for layer_name, kv_cache in self._spyre_kv_caches.items():
-                layer = static_ctx.get(layer_name)
-                impl = getattr(layer, "impl", None)
-                if not isinstance(impl, SpyreAttentionImpl):
-                    continue
-                builder = builders.get(layer_name)
-                # A KV-cache layer on this impl is always in an attention group whose
-                # backend builds SpyreAttentionMetadataBuilder, so a miss is a wiring or
-                # ordering bug (recording before initialize_attn_backend), not a config.
-                assert builder is not None, (
-                    f"Layer {layer_name} has a Spyre attention impl and a KV cache but no "
-                    "Spyre metadata builder; initialize_attn_backend() must run first."
-                )
-                logger.info("Recording attention graphs for layer %s...", layer_name)
-                total += impl.record_graphs(layer, kv_cache, builder)
-        logger.info(
-            "Attention graph recording complete: %d graphs in %.3fs.",
-            total,
-            time.time() - t0,
-        )
+            record_attention_graphs(
+                self.compilation_config.static_forward_context,
+                self._spyre_kv_caches,
+                self._attn_metadata_builders(),
+            )
 
     def _attn_metadata_builders(self) -> dict[str, SpyreAttentionMetadataBuilder]:
         """Each layer's metadata builder: attention groups' specs (block size, sliding
@@ -1425,100 +1251,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
             hidden_states = convert(hidden_states, self._spyre_device)
         return hidden_states, last_hidden_states
 
-    @torch.inference_mode()
     def _warm_pooler_row_widths(self, hidden_states: torch.Tensor) -> None:
-        """Compile the pooler's row gather at every row count serving can present.
-
-        ``_dummy_pooler_run`` only ever pools ``min(num_tokens, max_num_seqs)``
-        rows, but serving pools one row per *request* -- any count from 1 up. That
-        gather specializes on the exact index length, so every unseen count paid a
-        full Inductor compile mid-request; it was the whole residual warm-up gap
-        once the attention kernels were covered. The poolers round their row count
-        to a power of two (``pad_row_count_to_bucket``), so this sweep is short.
-
-        ``SpyreSequencePooler`` trims only after the classifier/embed head, so the head
-        sees these same bucket widths and is warmed at each. ``SpyreMeanPool``'s
-        rectangle reduce specializes on ``(extent, rows)`` and is warmed per declared
-        rectangle.
-        """
         if not self._pooling_on_spyre:
             return
-        rows = hidden_states.shape[0]
-        # poolers_by_task is a plain dict; nn.Module.modules() doesn't descend into it.
-        pooler = cast(VllmModelForPooling, self.get_model()).pooler
-        pooler_modules = list(_iter_modules(pooler))
-        mean_pooling = any(isinstance(m, SpyreMeanPool) for m in pooler_modules)
-        classifier_types = SpyreRobertaClassificationHead | SpyreClassifierLinear
-        classifier_heads = [
-            m
-            for m in pooler_modules
-            if isinstance(getattr(m, "classifier", None), classifier_types)
-        ]
-        embed_heads = [m for m in pooler_modules if isinstance(m, SpyreEmbeddingPoolerHead)]
-        token_poolers = [m for m in pooler_modules if isinstance(m, SpyreTokenPooler)]
-        # Up to the power of two at or above the limit, which is not itself always one:
-        # 6 sequences round up to 8 rows, so stopping at the limit misses that width.
-        limit = 1 << max(0, self.scheduler_config.max_num_seqs - 1).bit_length()
-        widths = [1 << i for i in range(limit.bit_length()) if 1 << i <= rows]
-        # MEAN on a rectangle reduces its first min(bucket, lanes) lanes; a grid with a
-        # non-power-of-two lane count hands the head that count instead of the bucket.
-        grid_shapes: set[tuple[int, int]] = set()
-        if mean_pooling:
-            grid_shapes = {
-                (extent, min(width, lanes))
-                for extent, lanes in self._encoder_rectangles
-                if extent * lanes == rows
-                for width in widths
-            }
-        for width in sorted(set(widths) | {lanes for _, lanes in grid_shapes}):
-            pooled = select_rows(hidden_states, torch.zeros(width, dtype=torch.int64))
-            for head in classifier_heads:
-                logits = head.classifier(pooled)
-                if head.activation is not None:
-                    head.activation(logits)
-            for head in embed_heads:
-                embeddings = head.projector(pooled) if head.projector is not None else pooled
-                if head.activation is not None:
-                    head.activation(embeddings)
-        if grid_shapes:
-            device = hidden_states.device
-            mask = convert(torch.zeros(rows, 1, dtype=torch.float16), device)
-            prod = _mean_pool_row_mask_mul(hidden_states, mask).clone()
-            for extent, lanes in grid_shapes:
-                lens = convert(torch.ones(lanes, 1, dtype=torch.float32), device)
-                _mean_pool_grid_reduce(prod, lens, extent)
-        for token_pooler in token_poolers:
-            self._warm_token_pool_widths(token_pooler, hidden_states)
-
-    def _warm_token_pool_widths(
-        self, token_pooler: SpyreTokenPooler, hidden_states: torch.Tensor
-    ) -> None:
-        """Compile ``SpyreAllPool``'s bucketed gather (and its head) at every declared length.
-
-        ``SpyreAllPool`` rounds each request's real token count up to the nearest
-        entry in ``len_ladder`` instead of tracking it exactly (see its docstring);
-        nothing before this swept that same ladder, so the first request landing on
-        an unseen length paid a full Inductor compile mid-request.
-        """
-        all_pool = token_pooler.pooling
-        if not isinstance(all_pool, SpyreAllPool):
-            return
-        head = token_pooler.head
-        rows = hidden_states.shape[0]
-        for length in sorted(set(all_pool.len_ladder)):
-            if length > rows:
-                continue
-            chunk = select_rows(hidden_states, torch.arange(length, dtype=torch.int64))
-            if head is None:
-                continue
-            classifier = getattr(head, "classifier", None)
-            logits = classifier(chunk) if classifier is not None else chunk
-            projector = getattr(head, "projector", None)
-            if projector is not None:
-                logits = projector(logits)
-            activation = getattr(head, "activation", None)
-            if activation is not None:
-                activation(logits)
+        warm_pooler_row_widths(
+            cast(VllmModelForPooling, self.get_model()).pooler,
+            hidden_states,
+            self._encoder_rectangles,
+            self.scheduler_config.max_num_seqs,
+        )
 
     @torch.inference_mode()
     def _warm_encoder_inline_paths(self) -> None:
@@ -1701,38 +1442,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if not self._pooling_on_spyre:
             return super()._dummy_pooler_run_task(hidden_states, task)
 
-        num_tokens = hidden_states.shape[0]
-        max_num_reqs = self.scheduler_config.max_num_seqs
-        num_reqs = min(num_tokens, max_num_reqs)
-        min_tokens_per_req = num_tokens // num_reqs
-        num_scheduled_tokens_np = np.full(num_reqs, min_tokens_per_req)
-        num_scheduled_tokens_np[-1] += num_tokens % num_reqs
-        assert np.sum(num_scheduled_tokens_np) == num_tokens
-        assert len(num_scheduled_tokens_np) == num_reqs
-
-        req_num_tokens = num_tokens // num_reqs
-        dummy_prompt_lens = torch.from_numpy(num_scheduled_tokens_np)
-        dummy_token_ids = torch.zeros(
-            (num_reqs, req_num_tokens), dtype=torch.int32, device=self.device
-        )
-
         model = cast(VllmModelForPooling, self.get_model())
-        dummy_pooling_params = PoolingParams(task=task)
-        dummy_pooling_params.verify(self.model_config)
-        to_update = model.pooler.get_pooling_updates(task)
-        to_update.apply(dummy_pooling_params)
-
-        dummy_metadata = PoolingMetadata(
-            prompt_lens=dummy_prompt_lens,
-            prompt_token_ids=dummy_token_ids,
-            prompt_token_ids_cpu=dummy_token_ids.cpu(),
-            pooling_params=[dummy_pooling_params] * num_reqs,
-            pooling_states=[PoolingStates() for _ in range(num_reqs)],
-        )
-        dummy_metadata.build_pooling_cursor(
-            num_scheduled_tokens_np,
-            seq_lens_cpu=dummy_prompt_lens,
-            device=torch.device("cpu"),
+        dummy_metadata = dummy_pooling_metadata(
+            model.pooler,
+            self.model_config,
+            task,
+            hidden_states.shape[0],
+            self.scheduler_config.max_num_seqs,
+            self.device,
         )
         return model.pooler(hidden_states=hidden_states, pooling_metadata=dummy_metadata)
 
@@ -1929,7 +1646,7 @@ def _set_spyre_compilation_settings(config: VllmConfig):
         if inductor_config.get("max_autotune", False):
             # Freezing folds per-block weights into each block's graph, defeating
             # artifact sharing. Warn rather than override an explicit max_autotune.
-            if _compile_granularity() == "block" and not config.model_config.enforce_eager:
+            if compile_granularity() == "block" and not config.model_config.enforce_eager:
                 logger.warning(
                     "max_autotune enables Inductor freezing, which folds per-block "
                     "weights into each block's graph and defeats per-block artifact "
