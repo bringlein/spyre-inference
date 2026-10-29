@@ -1188,8 +1188,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _dtype = get_current_vllm_config().model_config.dtype
         self.model_dtype: torch.dtype = _dtype if isinstance(_dtype, torch.dtype) else torch.float16
 
+        model_dtype_str = str(self.model_dtype).removeprefix("torch.")
         fp8_requested = kv_cache_dtype in FP8_KV_CACHE_DTYPES
         self.kv_cache_fp8 = fp8_requested and self.keeps_kv_cache
+        # Upstream sizes every other quantized dtype (fp8_e5m2, fp8_inc, nvfp4, ...) as
+        # uint8 bytes too, which allocate_pages would silently store as e4m3.
+        if not fp8_requested and kv_cache_dtype not in ("auto", "float16", "bfloat16"):
+            raise ValueError(
+                f"kv_cache_dtype={kv_cache_dtype} is not supported on Spyre; use 'auto', "
+                f"'{model_dtype_str}' or one of {', '.join(FP8_KV_CACHE_DTYPES)} "
+                "(float8 e4m3)."
+            )
         if self.kv_cache_fp8:
             if not self.supports_fp8_kv_cache:
                 raise ValueError(
@@ -1205,10 +1214,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # The kernels read a page at model dtype and Spyre has no cast on the way in, so
         # the two 2-byte dtypes are not interchangeable per-cache. A layer without a cache
         # has nothing to apply an fp8 dtype to; upstream passes the engine-wide one.
-        elif not fp8_requested and kv_cache_dtype not in (
-            "auto",
-            str(self.model_dtype).removeprefix("torch."),
-        ):
+        elif not fp8_requested and kv_cache_dtype not in ("auto", model_dtype_str):
             raise ValueError(
                 f"kv_cache_dtype={kv_cache_dtype} does not match the model dtype "
                 f"{self.model_dtype} on Spyre; use 'auto'."

@@ -195,7 +195,8 @@ vllm serve ibm-granite/granite-4.1-8b-fp8 --kv-cache-dtype fp8
 ```
 
 It needs the default head-major layout (`SPYRE_ATTN_KV_LAYOUT=head_major`) and a head size
-that is a multiple of 128. It does not raise capacity: the platform pins the block count
+that is a multiple of 128. Other quantized cache dtypes (`fp8_e5m2`, `fp8_inc`, `nvfp4`,
+...) are rejected at startup. It does not raise capacity: the platform pins the block count
 to `max_num_seqs` × `max_model_len` (`num_gpu_blocks_override`), so an fp8 cache holds the
 same number of tokens in half the device memory. Attention still computes in the model
 dtype: pages are dequantized on read with the checkpoint's per-layer KV scales, or 1.0
