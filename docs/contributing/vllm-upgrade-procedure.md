@@ -126,7 +126,14 @@ are missing.
 | `csrc/cpu/sampling_kernels.cpp` | same path (added in vllm#53913, after v0.28.0) | Gumbel noise is hashed per element instead of read from vLLM's 2^20-entry table, which leaves much of a large vocabulary unreachable (vllm#59786); `greedy_argmax` matches `torch.argmax` on NaN; inputs are checked. Port performance and correctness changes, never the table. |
 | `csrc/core/registration.h`, `cmake/utils.cmake`, `cmake/cpu_extension.cmake` | same paths | Fixed ISA baselines (x86 AVX512 + AVX2, POWER10, z15) instead of `-march=native`, so wheels are portable. |
 | `SpyreTopKTopPSampler.forward_native` (`spyre_inference/v1/sample/topk_topp_sampler.py`) | `TopKTopPSampler.forward_native` (`vllm/v1/sample/ops/topk_topp_sampler.py`) | Reimplements the upstream tail (sort-free top-k, the kernel draw); its comment names the vLLM version it mirrors. |
+| `spyre_inference/v1/spec_decode/{xpress_head,checkpoint}.py` | `vllm/model_executor/models/{qwen3_xpress,qwen3_dflash}.py` | Temporary compatibility for vllm#54448 (`ce9467b757`), which postdates 0.32.0. Replace with upstream XPress model/head subclasses when available, retaining the Spyre overrides. |
 | The sampler patch in `TorchSpyreModelRunner.__init__` | `Sampler` (`vllm/v1/sample/sampler.py`), its construction and `RejectionSampler(self.sampler)` (`vllm/v1/worker/gpu_model_runner.py`) | Relies on `Sampler` calling `self.greedy_sample` and `self.topk_topp_sampler`, and on the rejection sampler holding the same `Sampler` object. |
+
+`tests/spec_decode/test_xpress_vendored.py` deliberately fails if the new vLLM
+ships the XPress module or registers either XPress architecture. Follow
+[the cleanup issue](https://github.com/torch-spyre/spyre-inference/issues/1417)
+to migrate the temporary head, loader/config bridge and registrations before
+removing the canary. Keep the Spyre execution overrides and requalify the serving path.
 
 Diff the upstream side between the current pin and the target:
 
