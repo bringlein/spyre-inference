@@ -305,6 +305,11 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # tiled walk needs it materialized (see the construction site).
     mask_by_chunk_cpu: torch.Tensor | None = None
     mask_by_chunk_dev: torch.Tensor | None = None
+    # ALiBi's kv_pos - context_len, [padded_batch_blocks, B_seqs, 1, 1, block] fp16, which
+    # the kernel multiplies by the slopes. Built by an ALiBi impl at mirror time, because
+    # the builder does not know the slopes; head-independent, so it stays KV-narrow even
+    # where the mask materialises that axis.
+    rel_by_chunk_dev: torch.Tensor | None = None
 
     # Which one it is *is* the path selection: one rectangle for the dense path, a list
     # of groups for the ragged one. Imported under TYPE_CHECKING only -- the encoder
@@ -1141,6 +1146,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     supports_fp8_kv_cache: ClassVar[bool] = False
     # False for layers that keep no KV cache (encoder self-attention).
     keeps_kv_cache: ClassVar[bool] = True
+    # Whether this impl's batched decode kernel takes the ALiBi bias operands; only
+    # head-major's does.
+    _batched_decode_alibi_supported: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -1307,8 +1315,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # to int64 and fails eager; eager takes the per-seq loop instead.
         if not self._compile_attn:
             return False
-        # The batched kernel doesn't implement ALiBi.
-        return self.alibi_slopes is None
+        # Only the head-major batched kernel takes the bias operands.
+        return self.alibi_slopes is None or self._batched_decode_alibi_supported
 
     def _tiled_batched_decode_supported(self) -> bool:
         """Whether batched decode may run under the tiled walk; overridable."""
@@ -1361,8 +1369,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # and upstream's own unified_kv_cache_update op covers the rest.
 
         # Mirror batched-decode precomputes to device once per step, only for
-        # layers whose impl can actually use the batched kernel (skips ALiBi
-        # layers, eager attention and, under the tiled walk, the token-major layout).
+        # layers whose impl can actually use the batched kernel (skips eager
+        # attention, ALiBi on a kernel without the bias operands and, under the
+        # tiled walk, the token-major layout).
         if (
             self._batched_decode_preconditions_met(attn_metadata, k_pages.shape[0])
             and attn_metadata.rep_row_ids_dev is None
@@ -1735,6 +1744,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             blocks_per_chunk,
             block_size,
             output if store_out else None,
+            attn_metadata.rel_by_chunk_dev,
         )
         if store_out:
             return
@@ -1771,8 +1781,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         blocks_per_chunk: int,
         block_size: int,
         out: torch.Tensor | None,
+        alibi_rel: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run the batch's decode attention. The point where a subclass swaps kernels."""
+        """Run the batch's decode attention. The point where a subclass swaps kernels.
+
+        ``alibi_rel`` is always None here: the token-major kernel takes no bias operands,
+        which is what `_batched_decode_alibi_supported` encodes.
+        """
+        assert alibi_rel is None
         return self._decode_fn(
             query_dev,
             rep_row_ids,

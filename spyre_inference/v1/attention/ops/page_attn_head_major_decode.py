@@ -43,6 +43,7 @@ def page_attn_head_major_decode_kernel(
     head_size,
     block_size,
     logits_soft_cap=0.0,
+    alibi_stack=None,
     out=None,
     v_scale=None,
 ):
@@ -65,6 +66,9 @@ def page_attn_head_major_decode_kernel(
             sliced out of a per-block table (a row of a stacked index table reads wrong,
             torch-spyre#3851). Pure cache geometry, so it is built once.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
+        alibi_stack: [num_blocks, num_kv_heads, num_queries_per_kv, 1, block_size], or
+            None. Layout-agnostic, so it is the operand token-major takes; the
+            query-axis extent of 1 is derived at its construction site.
         out: buffer to store into, or None to return the result instead.
         v_scale: float V scale of a float8 cache, None for a model-dtype one; the caller
             folds k_scale into ``scale``.
@@ -77,7 +81,7 @@ def page_attn_head_major_decode_kernel(
     q = query.index_select(0, query_row_index).reshape(num_kv_heads, num_queries_per_kv, head_size)
 
     def block_body(carry, tiles):
-        page_index, k_pages, v_pages, mask_tile, q, kv_row_pool = tiles
+        page_index, k_pages, v_pages, mask_tile, q, kv_row_pool, *rest = tiles
         # A tile is readable whole or as the single element `page_index[0, 0:1]` is; a
         # [num_kv_heads]-wide read of a wider row is neither, so the rows come from the
         # pool. See the `kv_row_pool` docstring.
@@ -96,6 +100,10 @@ def page_attn_head_major_decode_kernel(
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after
             # it would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+        if rest:
+            # The query axis is folded away here, so the shared tile drops its singleton
+            # query dim. Before the mask, whose finfo.min the bias cannot un-mask.
+            scores = scores + rest[0][0].reshape(num_kv_heads, num_queries_per_kv, block_size)
         # At one query row the mask is head-independent, so its [1, block_size] tile
         # broadcasts across the folded group axis.
         scores = scores + mask_tile[0]
@@ -124,10 +132,22 @@ def page_attn_head_major_decode_kernel(
 
     state_shape = (num_kv_heads, num_queries_per_kv, 1)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
+    operands = [
+        page_index_table[:num_blocks],
+        k_pages,
+        v_pages,
+        mask_stack[:num_blocks],
+        q,
+        kv_row_pool,
+    ]
+    dims: list[int | None] = [0, None, None, 0, None, None]
+    if alibi_stack is not None:
+        operands.append(alibi_stack[:num_blocks])
+        dims.append(0)
     (_, tile_sum, tile_output), _ = walk_tiles(
         block_body,
-        (page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q, kv_row_pool),
-        dims=(0, None, None, 0, None, None),
+        tuple(operands),
+        dims=tuple(dims),
         tile_size=1,
         init=(
             torch.full(state_shape, float("-inf"), **state_kwargs),

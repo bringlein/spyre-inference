@@ -39,6 +39,7 @@ def page_attn_head_major_prefill_kernel(
     num_kv_heads,
     head_size,
     logits_soft_cap=0.0,
+    alibi_stack=None,
     out=None,
     v_scale=None,
 ):
@@ -50,6 +51,9 @@ def page_attn_head_major_prefill_kernel(
             holding the i-th active block's page index at column 0, indexing
             ``[num_blocks_total, num_kv_heads, block_size, head_size]``.
         mask_stack: [num_blocks, padded_query_len, block_size], tiled on dim 0.
+        alibi_stack: [num_blocks, num_kv_heads, num_queries_per_kv, 1, block_size], or
+            None. Layout-agnostic, so it is the operand token-major takes; the
+            query-axis extent of 1 is derived at its construction site.
         v_scale: float V scale of a float8 cache, None for a model-dtype one; the caller
             folds k_scale into ``scale``.
     """
@@ -68,11 +72,14 @@ def page_attn_head_major_prefill_kernel(
 
     # Both walks tile tensor axes, so what an unrolled walk read per block arrives
     # stacked on dim 0.
-    operands = (page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q)
-    dims: tuple[int | None, ...] = (0, None, None, 0, None)
+    operands = [page_index_table[:num_blocks], k_pages, v_pages, mask_stack[:num_blocks], q]
+    dims: list[int | None] = [0, None, None, 0, None]
+    if alibi_stack is not None:
+        operands.append(alibi_stack[:num_blocks])
+        dims.append(0)
 
     def block_body(carry, tiles):
-        page_index, k_pages, v_pages, mask_tile, q = tiles
+        page_index, k_pages, v_pages, mask_tile, q, *rest = tiles
 
         # One row of the unfolded cache: the folded per-kv-head gather exists to split for LX
         # residency. index_select, not subscripting, which lowers to aten.index and fails eager.
@@ -88,6 +95,9 @@ def page_attn_head_major_prefill_kernel(
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after it
             # would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+        if rest:
+            # Before the mask, whose finfo.min the bias cannot un-mask.
+            scores = scores + rest[0][0]
         scores = scores + mask_tile[0]
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
@@ -114,8 +124,8 @@ def page_attn_head_major_prefill_kernel(
     state_kwargs = {"dtype": q.dtype, "device": q.device}
     (_, tile_sum, tile_output), _ = walk_tiles(
         block_body,
-        operands,
-        dims=dims,
+        tuple(operands),
+        dims=tuple(dims),
         tile_size=1,
         init=(
             torch.full(state_shape, float("-inf"), **state_kwargs),

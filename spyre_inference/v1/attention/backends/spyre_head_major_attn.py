@@ -24,7 +24,7 @@ too, so it needs none of the per-sequence kernel's ``(page, kv_head)`` fold.
 
 Everything above the cache's memory is shared with ``spyre_attn``; the places that touch
 it — advertised shape, allocation, kernels, index tables — are duplicated rather than
-parameterised. This layout does not carry ALiBi.
+parameterised.
 """
 
 import contextlib
@@ -155,6 +155,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     """
 
     supports_fp8_kv_cache: ClassVar[bool] = True
+    _batched_decode_alibi_supported: ClassVar[bool] = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -168,13 +169,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # this leaves the rest of the model eager.
         self._decode_attn_fn = _page_attn_decode_compiled
         self._decode_fn = _batched_decode_compiled
-        if self.alibi_slopes is not None:
-            raise NotImplementedError(
-                "ALiBi is not supported on the head-major KV layout; use the "
-                "token-major layout (SPYRE_ATTN_KV_LAYOUT=token_major)."
-            )
         self._folded: SpyrePagedKVCache | None = None
         self._kv_row_pool_device: torch.Tensor | None = None
+        self._alibi_slopes_dev: torch.Tensor | None = None
 
         logger.info_once(
             "Using SpyreHeadMajorAttentionBackend with a head-major paged KV cache, "
@@ -272,13 +269,53 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # The split index below uploads one page ID per stick.
         return True
 
+    def _alibi_rel_by_chunk(self, attn_metadata: "SpyreAttentionMetadata") -> torch.Tensor:
+        """ALiBi's ``kv_pos - context_len`` per block slot, shaped like ``mask_by_chunk``.
+
+        Built here rather than in the builder, which does not know the slopes, and left
+        head-independent so it stays KV-narrow; the kernel multiplies by the slopes.
+        Slot i holds absolute block ``active_block_indices[s][i]`` under a window and
+        block i otherwise, matching the builder's page-id fill. Slots past a sequence's
+        extent get a finite don't-care: the mask saturates them, as it does for the
+        per-sequence tiles.
+        """
+        b = attn_metadata.padded_num_seqs
+        pbb = attn_metadata.padded_batch_blocks
+        assert b is not None and pbb is not None
+        block_size = attn_metadata.block_size
+        active = attn_metadata.active_block_indices
+        num_decode = attn_metadata.num_decode_seqs
+
+        offsets = torch.arange(block_size, dtype=self.model_dtype)
+        rel = torch.zeros(pbb, b, 1, 1, block_size, dtype=self.model_dtype)
+        for s in range(num_decode):
+            # One query token, so context_len is seq_len - 1.
+            context_len = int(attn_metadata.seq_lens[s].item()) - 1
+            slots = range(min(pbb, len(active[s]))) if active is not None else range(pbb)
+            for i in slots:
+                abs_block = active[s][i] if active is not None else i
+                rel[i, s, 0, 0] = abs_block * block_size + offsets - context_len
+        return rel
+
     def _mirror_batched_decode_indices(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
     ) -> None:
+        rel_cpu = None if self.alibi_slopes is None else self._alibi_rel_by_chunk(attn_metadata)
+        if rel_cpu is not None and self._alibi_slopes_dev is None:
+            # Layer-static, so once per impl rather than once per step. [KV, group, 1]
+            # aligns onto a rel tile's trailing (kv, 1, block_size).
+            self._alibi_slopes_dev = convert(
+                self.alibi_slopes.reshape(self.num_kv_heads, self.num_queries_per_kv, 1),
+                device=device,
+            )
+
         # TEMPORARY until torch-spyre#4603 is validated: each page ID gets its own
         # stick. Preserve the CPU metadata shapes used by the recorder and dispatch.
         if not USE_FOR_EACH_TILE:
-            return super()._mirror_batched_decode_indices(attn_metadata, device)
+            super()._mirror_batched_decode_indices(attn_metadata, device)
+            if rel_cpu is not None:
+                attn_metadata.rel_by_chunk_dev = convert(rel_cpu, device=device)
+            return
         assert attn_metadata.rep_row_ids_cpu is not None
         assert attn_metadata.chunk_page_ids_cpu is not None
         assert attn_metadata.mask_by_chunk_cpu is not None
@@ -303,6 +340,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             ),
             device=device,
         )
+        if rel_cpu is not None:
+            attn_metadata.rel_by_chunk_dev = convert(
+                rel_cpu.reshape(c, bpc, b, *rel_cpu.shape[2:]), device=device
+            )
 
     def _run_batched_decode(
         self,
@@ -316,8 +357,15 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         blocks_per_chunk: int,
         block_size: int,
         out: torch.Tensor | None,
+        alibi_rel: torch.Tensor | None = None,
     ) -> torch.Tensor:
         scale, v_args = self._read_scales()
+        # By keyword: `*v_args` already occupies the positional v_scale slot.
+        alibi_args = (
+            {}
+            if alibi_rel is None
+            else {"alibi_rel": alibi_rel, "alibi_slopes": self._alibi_slopes_dev}
+        )
         with _capped_cores(b_seqs * blocks_per_chunk * self.num_kv_heads):
             return self._decode_fn(
                 query_dev,
@@ -336,6 +384,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.logits_soft_cap,
                 out,
                 *v_args,
+                **alibi_args,
             )
 
     def _run_page_attn(
@@ -381,6 +430,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     self.num_kv_heads,
                     self.head_size,
                     self.logits_soft_cap,
+                    alibi_stack,
                     out,
                     *v_args,
                 )
@@ -406,6 +456,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.head_size,
                 self.block_size,
                 self.logits_soft_cap,
+                alibi_stack,
                 out,
                 *v_args,
             )

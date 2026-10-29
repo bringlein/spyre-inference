@@ -587,7 +587,8 @@ class TestRecordBatchedDecode:
         assert _record(impl, wide_cache, builder) == self._expected(bucketer, 0)
 
     def test_alibi_layer_records_nothing_batched(self, default_vllm_config, wide_cache, builder):
-        """The batched kernel doesn't implement ALiBi, so those layers never dispatch to it."""
+        """The token-major batched kernel takes no bias operands, so those layers
+        never dispatch to it."""
         torch._dynamo.reset()
         get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
         alibi_impl = SpyreAttentionImpl(
@@ -601,6 +602,31 @@ class TestRecordBatchedDecode:
         bucketer = builder._attn_bucketer = make_bucketer()
 
         assert _record(alibi_impl, wide_cache, builder) == self._expected(bucketer, 0)
+
+    def test_head_major_alibi_layer_stays_eligible_for_batched_decode(self, default_vllm_config):
+        """The opposite of the above: an ALiBi layer must stay on head-major's batched
+        kernel, which does take the bias operands.
+
+        The gate only: this suite runs its kernels on CPU, where the head-major page
+        gather has no Inductor lowering. The recording is covered on device by
+        ``test_head_major_warmup_records_a_batched_decode_variant[alibi]``.
+        """
+        from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+            SpyreHeadMajorAttentionImpl,
+        )
+
+        get_current_vllm_config().compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+        kwargs = dict(
+            num_heads=NUM_HEADS,
+            head_size=HEAD_SIZE,
+            scale=1.0 / (HEAD_SIZE**0.5),
+            num_kv_heads=NUM_KV_HEADS,
+            sliding_window=None,
+        )
+        alibi = SpyreHeadMajorAttentionImpl(alibi_slopes=[0.5] * NUM_HEADS, **kwargs)
+        assert alibi._batched_decode_supported()
+        token_major = SpyreAttentionImpl(alibi_slopes=[0.5] * NUM_HEADS, **kwargs)
+        assert not token_major._batched_decode_supported()
 
     def test_skips_batched_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
         """The gather's entry axis, not the block count, is what a small cache bounds."""

@@ -103,6 +103,8 @@ def batched_decode_head_major_kernel(
     logits_soft_cap=0.0,
     out=None,
     v_scale=None,
+    alibi_rel=None,
+    alibi_slopes=None,
 ):
     """Read head-major pages and compute one decode output per sequence/query head.
 
@@ -116,6 +118,12 @@ def batched_decode_head_major_kernel(
     H is num_kv_heads for the tiled walk and 1 (broadcast) for the Python walk.
     The split-index form is used only with for_each_tile; its explicit device
     layout places each page ID in a separate stick so entries can split across cores.
+
+    ALiBi arrives split in two, or both None: ``alibi_rel`` is the mask-shaped
+    ``kv_pos - context_len``, head-independent so its KV extent is always 1, and
+    ``alibi_slopes`` is the layer-static [num_kv_heads, num_queries_per_kv, 1]. The
+    product is formed in-kernel so the per-step transfer does not carry a tensor
+    num_queries_per_kv times larger than the mask.
 
     A float8 page is cast to the query dtype after its gather and v_scale scales the
     output; the caller folds k_scale into ``scale``.
@@ -147,7 +155,7 @@ def batched_decode_head_major_kernel(
         return chunk_sum, chunk_out
 
     def chunk_body(carry, tiles):
-        page_ids, mask_rows, k_pages, v_pages, q = tiles
+        page_ids, mask_rows, k_pages, v_pages, q, *rest = tiles
         if split_index:
             # Workaround walk: consume the chunk axis -> [E, 1] pages the gather splits on.
             page_ids = page_ids[0]
@@ -170,6 +178,14 @@ def batched_decode_head_major_kernel(
         sc = scores.reshape(
             blocks_per_chunk, num_seqs, num_kv_heads, num_queries_per_kv, block_size
         )
+        if rest:
+            # Before the mask, whose finfo.min the bias cannot un-mask. Slopes come
+            # through the walk rather than the closure so the lowering sees a device
+            # operand.
+            rel_rows, slopes = rest
+            if split_index:
+                rel_rows = rel_rows.reshape(blocks_per_chunk, num_seqs, *rel_rows.shape[3:])
+            sc = sc + slopes * rel_rows
         sc = sc + mask_rows
         if use_entry_local:
             return (
@@ -216,10 +232,16 @@ def batched_decode_head_major_kernel(
     state_shape = (*slots, 1)
     out_shape = (*slots, head_size)
     state_kwargs = {"dtype": q.dtype, "device": q.device}
+    operands = [chunk_page_ids, mask_by_chunk, k_pages, v_pages, q]
+    dims: list[int | None] = [0, 0, None, None, None]
+    if alibi_rel is not None:
+        assert alibi_slopes is not None, "ALiBi needs both the rel tiles and the slopes"
+        operands += [alibi_rel, alibi_slopes]
+        dims += [0, None]
     carry, _ = walk_tiles(
         chunk_body,
-        (chunk_page_ids, mask_by_chunk, k_pages, v_pages, q),
-        dims=(0, 0, None, None, None),
+        tuple(operands),
+        dims=tuple(dims),
         tile_size=1 if split_index else blocks_per_chunk,
         init=(
             torch.full(state_shape, float("-inf"), **state_kwargs),

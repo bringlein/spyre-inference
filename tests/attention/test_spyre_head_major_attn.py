@@ -138,6 +138,7 @@ def _run_head_major_attn_test(
     configure_compilation: str,
     configure_device: str,
     soft_cap: float | None = None,
+    use_alibi: bool = False,
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
@@ -158,13 +159,13 @@ def _run_head_major_attn_test(
         assert_close_outliers,
         ref_attn,
     )
+    from test_spyre_attn import _alibi_slopes
 
     num_blocks = 256
     torch.set_default_device("cpu")
     set_random_seed(0)
 
-    # This layout does not carry ALiBi; the impl rejects slopes at construction.
-    alibi_slopes = None
+    alibi_slopes = _alibi_slopes(num_query_heads) if use_alibi else None
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
@@ -585,7 +586,7 @@ def test_fp8_prefill_reads_match_the_dequantized_cache(monkeypatch):
     scale = head_size**-0.5
 
     got = page_attn_head_major_prefill_kernel(
-        query, rows, k8, v8, index_table, mask, scale * k_scale, *args, 0.0, None, v_scale
+        query, rows, k8, v8, index_table, mask, scale * k_scale, *args, 0.0, None, None, v_scale
     )
     want = page_attn_head_major_prefill_kernel(
         query, rows, k_dq, v_dq, index_table, mask, scale, *args
@@ -951,6 +952,57 @@ def test_head_major_attn_soft_cap(
     )
 
 
+# The bias operand is token-major's, unchanged; what is tested is its plumbing through
+# both per-sequence kernels and the broadcast against each one's score shape.
+#
+# The lone-decode case is kv=128 (one block), not kv=256: a single decode sequence
+# spanning two blocks trips a restickify failure in head-major batched decode that has
+# nothing to do with ALiBi. It reproduces on main with no bias operands in the tree, and
+# passes under SPYRE_BATCHED_DECODE=0. Multi-sequence decode at that width is covered by
+# `mixed_batch` and by test_head_major_batched_decode_correctness.
+@pytest.mark.parametrize(
+    "seq_lens,block_size,sliding_window,soft_cap,num_query_heads,num_kv_heads",
+    [
+        pytest.param([(1, 128)], 128, None, None, 32, 8, id="decode(q=1,kv=128)"),
+        pytest.param([(64, 256)], 64, None, None, 32, 8, id="prefill(q=64,kv=256)"),
+        pytest.param([(1, 300), (64, 200)], 64, None, None, 32, 8, id="mixed_batch"),
+        pytest.param([(1, 300), (64, 200)], 64, None, None, 8, 1, id="mqa"),
+        pytest.param([(64, 256)], 64, 64, None, 32, 8, id="sliding_window"),
+        pytest.param([(1, 300), (64, 200)], 64, None, 30.0, 32, 8, id="soft_cap"),
+    ],
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_attn_alibi(
+    default_vllm_config,
+    seq_lens,
+    block_size,
+    sliding_window,
+    soft_cap,
+    num_query_heads,
+    num_kv_heads,
+    configure_compilation,
+    configure_device,
+):
+    _run_head_major_attn_test(
+        seq_lens=seq_lens,
+        block_size=block_size,
+        sliding_window=sliding_window,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        soft_cap=soft_cap,
+        use_alibi=True,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+    )
+
+
 @pytest.mark.parametrize(
     "num_query_heads,num_kv_heads",
     [pytest.param(8, 8, id="mha"), pytest.param(8, 1, id="mqa")],
@@ -977,6 +1029,7 @@ def test_head_major_attn_head_configs(
     )
 
 
+@pytest.mark.parametrize("use_alibi", [False, True], ids=["plain", "alibi"])
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -987,11 +1040,14 @@ def test_head_major_attn_head_configs(
 )
 @torch.inference_mode()
 def test_head_major_matches_token_major(
-    default_vllm_config, configure_compilation, configure_device
+    default_vllm_config, use_alibi, configure_compilation, configure_device
 ):
     """Both backends over the same logical KV must agree far more tightly than
-    either agrees with the fp16 CPU reference: the layout is the only difference."""
+    either agrees with the fp16 CPU reference: the layout is the only difference.
+
+    Under ALiBi this checks the head-major bias plumbing against the trusted path."""
     from spyre_testing_plugin.attn_helpers import _build_metadata, _fused_qkv_kv_views
+    from test_spyre_attn import _alibi_slopes
 
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -1065,6 +1121,7 @@ def test_head_major_matches_token_major(
             head_size=head_size,
             scale=scale,
             num_kv_heads=num_kv_heads,
+            alibi_slopes=_alibi_slopes(num_query_heads) if use_alibi else None,
         )
         spec = AttentionSpec(
             block_size=block_size,
@@ -1287,7 +1344,7 @@ def test_page_attn_head_major_matches_fp32_reference():
             d,
             block,
             soft_cap,
-            None,
+            out=None,
         )
         expected = ref_attn(
             query=query.index_select(0, rows.to(torch.int64)),
@@ -1556,15 +1613,27 @@ def batched_decode_calls(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "seq_lens,soft_cap",
+    "seq_lens,soft_cap,use_alibi",
     [
-        pytest.param([(1, 256), (1, 512), (1, 128), (1, 384)] * 2, None, id="bucket_exact(N=8)"),
         pytest.param(
-            [(1, 128), (1, 256), (1, 384), (1, 512), (1, 128)], None, id="bucket_pad(N=5_bucket=8)"
+            [(1, 256), (1, 512), (1, 128), (1, 384)] * 2, None, False, id="bucket_exact(N=8)"
+        ),
+        pytest.param(
+            [(1, 128), (1, 256), (1, 384), (1, 512), (1, 128)],
+            None,
+            False,
+            id="bucket_pad(N=5_bucket=8)",
         ),
         # Leading decode prefix batched, trailing prefill through the per-seq loop.
-        pytest.param([(1, 256)] * 4 + [(64, 256)], None, id="mixed_decode_prefix(N=4+1)"),
-        pytest.param([(1, 256), (1, 512), (1, 128), (1, 384)], 50.0, id="soft_cap(N=4)"),
+        pytest.param([(1, 256)] * 4 + [(64, 256)], None, False, id="mixed_decode_prefix(N=4+1)"),
+        pytest.param([(1, 256), (1, 512), (1, 128), (1, 384)], 50.0, False, id="soft_cap(N=4)"),
+        # Ragged contexts, so each sequence's rel tiles differ: a per-sequence
+        # context_len mix-up shows up here and not in a uniform batch.
+        pytest.param([(1, 256), (1, 512), (1, 128), (1, 384)], None, True, id="alibi(N=4)"),
+        pytest.param([(1, 256)] * 4 + [(64, 256)], None, True, id="alibi_mixed(N=4+1)"),
+        pytest.param(
+            [(1, 256), (1, 512), (1, 128), (1, 384)], 50.0, True, id="alibi_soft_cap(N=4)"
+        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -1580,6 +1649,7 @@ def test_head_major_batched_decode_correctness(
     batched_decode_calls,
     seq_lens,
     soft_cap,
+    use_alibi,
     configure_compilation,
     configure_device,
 ):
@@ -1595,10 +1665,12 @@ def test_head_major_batched_decode_correctness(
         configure_compilation=configure_compilation,
         configure_device=configure_device,
         soft_cap=soft_cap,
+        use_alibi=use_alibi,
     )
     assert batched_decode_calls, "the batch fell back to the per-seq loop"
 
 
+@pytest.mark.parametrize("use_alibi", [False, True], ids=["plain", "alibi"])
 @pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
@@ -1608,16 +1680,17 @@ def test_head_major_batched_decode_correctness(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
 def test_head_major_warmup_records_a_batched_decode_variant(
-    default_vllm_config, batched_decode_calls, configure_compilation, configure_device
+    default_vllm_config, batched_decode_calls, use_alibi, configure_compilation, configure_device
 ):
     """Warmup can trace this layout's batched kernel, so serving does not compile it.
 
     One bucket, not the whole enumeration: what matters is that the recorder reaches the
-    folded gather through builder-produced metadata.
+    folded gather through builder-produced metadata, with the bias operands included.
     """
     import sys
     from unittest.mock import MagicMock
 
+    from test_spyre_attn import _alibi_slopes
     from vllm.config import get_current_vllm_config
 
     from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -1650,6 +1723,7 @@ def test_head_major_warmup_records_a_batched_decode_variant(
         head_size=head_size,
         scale=head_size**-0.5,
         num_kv_heads=num_kv_heads,
+        alibi_slopes=_alibi_slopes(num_query_heads) if use_alibi else None,
     )
     assert impl._batched_decode_supported()
 
